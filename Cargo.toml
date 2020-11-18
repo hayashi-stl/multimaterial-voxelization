@@ -1,0 +1,12 @@
+[package]
+name = "voxelization"
+version = "0.1.0"
+authors = ["Joshua Ani <josh4820@gmail.com>"]
+edition = "2018"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+tri-mesh = { git = "https://github.com/josh65536/tri-mesh" }
+fnv = "1.0.7"
+cgmath = "0.17.0"
