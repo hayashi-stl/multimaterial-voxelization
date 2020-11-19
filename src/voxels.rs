@@ -21,7 +21,11 @@ impl Voxels {
 
 impl From<MaterialMesh> for Voxels {
     fn from(mesh: MaterialMesh) -> Self {
-        let slice = mesh.axis_slice(Axis::Z, Chunk::SIZE as f64);
+        let slices = mesh.axis_slice(Axis::Z, Chunk::SIZE as f64);
+        
+        for (i, slice) in slices.iter().enumerate() {
+            slice.export_debug_obj(format!("assets/debug/slice_{:03}.obj", i));
+        }
         Self::default()
     }
 }

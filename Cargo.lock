@@ -81,6 +81,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "float-ord"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7bad48618fdb549078c333a7a8528acb57af271d0433bdecd523eb620628364e"
+
+[[package]]
 name = "fnv"
 version = "1.0.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -296,7 +302,7 @@ dependencies = [
 [[package]]
 name = "tri-mesh"
 version = "0.5.0"
-source = "git+https://github.com/josh65536/tri-mesh#0c5b4f1edca9106cd4c5dd94d2c0bda1f2b5ab14"
+source = "git+https://github.com/josh65536/tri-mesh#46d100e62a6d637b5fd88126307565ebf93c9d1e"
 dependencies = [
  "bincode",
  "cgmath 0.16.1",
@@ -315,6 +321,7 @@ name = "voxelization"
 version = "0.1.0"
 dependencies = [
  "cgmath 0.17.0",
+ "float-ord",
  "fnv",
  "tri-mesh",
 ]
