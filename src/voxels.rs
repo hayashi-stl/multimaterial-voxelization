@@ -2,7 +2,7 @@ use cgmath::prelude::*;
 use cgmath::Vector3;
 use fnv::FnvHashMap;
 
-use crate::material_mesh::{MaterialID, MaterialMesh, Axis};
+use crate::material_mesh::{Axis, MaterialID, MaterialMesh};
 
 pub type Vec3i = Vector3<i32>;
 pub type Vec3f = Vector3<f32>;
@@ -21,8 +21,8 @@ impl Voxels {
 
 impl From<MaterialMesh> for Voxels {
     fn from(mesh: MaterialMesh) -> Self {
-        let slices = mesh.axis_slice(Axis::Z, Chunk::SIZE as f64);
-        
+        let (slices, min_z) = mesh.axis_slice(Axis::Z, Chunk::SIZE as f64);
+
         for (i, slice) in slices.iter().enumerate() {
             slice.export_debug_obj(format!("assets/debug/slice_{:03}.obj", i));
         }
