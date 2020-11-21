@@ -44,10 +44,17 @@ struct EdgeRange {
     triangulation: bool,
 }
 
-impl MaterialMesh {
-    const DOT_EPSILON: f64 = 1e-5;
+#[derive(Clone, Debug)]
+struct FaceRange {
+    min: f64,
+    max: f64,
+    face_proj_area: f64,
+}
 
-    fn new(mesh: Mesh<MaterialID>) -> Self {
+impl MaterialMesh {
+    const EPSILON: f64 = 1e-5;
+
+    pub fn new(mesh: Mesh<MaterialID>) -> Self {
         Self { mesh }
     }
 
@@ -162,7 +169,7 @@ impl MaterialMesh {
 
                 if self.mesh.is_vertex_on_boundary(vertex_id) {
                     // Boundary vertex. Faces must be coplanar, boundary edges must be collinear
-                    if uniform && min_dot > 1.0 - Self::DOT_EPSILON {
+                    if uniform && min_dot > 1.0 - Self::EPSILON {
                         let boundary = self
                             .mesh
                             .vertex_halfedge_iter(vertex_id)
@@ -173,82 +180,83 @@ impl MaterialMesh {
                             .map(|e| self.mesh.edge_vector(*e).normalize())
                             .collect::<Vec<_>>();
 
-                        if boundary_dirs[0].dot(boundary_dirs[1]) < -1.0 + Self::DOT_EPSILON {
+                        if boundary_dirs[0].dot(boundary_dirs[1]) < -1.0 + Self::EPSILON {
                             self.dissolve_boundary_vertex(vertex_id);
                         }
                     }
                 } else {
-                    let bend = self
-                        .mesh
-                        .vertex_halfedge_iter(vertex_id)
-                        .filter(|e| {
-                            let mut walker = self.mesh.walker_from_halfedge(*e);
-                            let faces = [
-                                walker.face_id().unwrap(),
-                                walker.as_twin().face_id().unwrap(),
-                            ];
+                    // TODO: Decide if bend and flat vertices should be decimated
+                    //let bend = self
+                    //    .mesh
+                    //    .vertex_halfedge_iter(vertex_id)
+                    //    .filter(|e| {
+                    //        let mut walker = self.mesh.walker_from_halfedge(*e);
+                    //        let faces = [
+                    //            walker.face_id().unwrap(),
+                    //            walker.as_twin().face_id().unwrap(),
+                    //        ];
 
-                            self.mesh.face_tag(faces[0]) != self.mesh.face_tag(faces[1])
-                                || self
-                                    .mesh
-                                    .face_normal(faces[0])
-                                    .dot(self.mesh.face_normal(faces[1]))
-                                    < 1.0 - Self::DOT_EPSILON
-                        })
-                        .collect::<Vec<_>>();
+                    //        self.mesh.face_tag(faces[0]) != self.mesh.face_tag(faces[1])
+                    //            || self
+                    //                .mesh
+                    //                .face_normal(faces[0])
+                    //                .dot(self.mesh.face_normal(faces[1]))
+                    //                < 1.0 - Self::DOT_EPSILON
+                    //    })
+                    //    .collect::<Vec<_>>();
 
-                    let bend_dirs = bend
-                        .iter()
-                        .map(|e| self.mesh.edge_vector(*e).normalize())
-                        .collect::<Vec<_>>();
+                    //let bend_dirs = bend
+                    //    .iter()
+                    //    .map(|e| self.mesh.edge_vector(*e).normalize())
+                    //    .collect::<Vec<_>>();
 
-                    if bend.len() == 2 && bend_dirs[0].dot(bend_dirs[1]) < -1.0 + Self::DOT_EPSILON
-                    {
-                        // Bend vertex. Faces on each side must be coplanar, bend edges must be collinear (√)
-                        let mut faces: Vec<Vec<FaceID>> = vec![vec![], vec![]];
-                        let mut walker = self.mesh.walker_from_halfedge(bend[0]);
+                    //if bend.len() == 2 && bend_dirs[0].dot(bend_dirs[1]) < -1.0 + Self::DOT_EPSILON
+                    //{
+                    //    // Bend vertex. Faces on each side must be coplanar, bend edges must be collinear (√)
+                    //    let mut faces: Vec<Vec<FaceID>> = vec![vec![], vec![]];
+                    //    let mut walker = self.mesh.walker_from_halfedge(bend[0]);
 
-                        while walker.halfedge_id().unwrap() != bend[1] {
-                            walker.as_twin().as_next();
-                            faces[0].push(walker.face_id().unwrap());
-                        }
-                        while walker.halfedge_id().unwrap() != bend[0] {
-                            walker.as_twin().as_next();
-                            faces[1].push(walker.face_id().unwrap());
-                        }
+                    //    while walker.halfedge_id().unwrap() != bend[1] {
+                    //        walker.as_twin().as_next();
+                    //        faces[0].push(walker.face_id().unwrap());
+                    //    }
+                    //    while walker.halfedge_id().unwrap() != bend[0] {
+                    //        walker.as_twin().as_next();
+                    //        faces[1].push(walker.face_id().unwrap());
+                    //    }
 
-                        let normals = faces
-                            .iter()
-                            .map(|arr| {
-                                arr.iter()
-                                    .map(|f| self.mesh.face_normal(*f))
-                                    .sum::<Vec3>()
-                                    .normalize()
-                            })
-                            .collect::<Vec<_>>();
-                        let min_dots = faces
-                            .iter()
-                            .zip(normals.iter())
-                            .map(|(arr, normal)| {
-                                arr.iter()
-                                    .map(|f| FloatOrd(self.mesh.face_normal(*f).dot(*normal)))
-                                    .min()
-                                    .unwrap()
-                                    .0
-                            })
-                            .collect::<Vec<_>>();
+                    //    let normals = faces
+                    //        .iter()
+                    //        .map(|arr| {
+                    //            arr.iter()
+                    //                .map(|f| self.mesh.face_normal(*f))
+                    //                .sum::<Vec3>()
+                    //                .normalize()
+                    //        })
+                    //        .collect::<Vec<_>>();
+                    //    let min_dots = faces
+                    //        .iter()
+                    //        .zip(normals.iter())
+                    //        .map(|(arr, normal)| {
+                    //            arr.iter()
+                    //                .map(|f| FloatOrd(self.mesh.face_normal(*f).dot(*normal)))
+                    //                .min()
+                    //                .unwrap()
+                    //                .0
+                    //        })
+                    //        .collect::<Vec<_>>();
 
-                        if min_dots.into_iter().all(|d| d > 1.0 - Self::DOT_EPSILON) {
-                            // TODO: Remove vertex
-                            println!("Redundant bend vertex: {:?}", vertex_id);
-                        }
-                    } else if bend.len() == 0 {
-                        // Flat vertex. Faces on each side must be coplanar.
-                        if uniform && min_dot > 1.0 - Self::DOT_EPSILON {
-                            // TODO: Remove vertex
-                            println!("Redundant flat vertex: {:?}", vertex_id);
-                        }
-                    }
+                    //    if min_dots.into_iter().all(|d| d > 1.0 - Self::DOT_EPSILON) {
+                    //        // TODO: Remove vertex
+                    //        println!("Redundant bend vertex: {:?}", vertex_id);
+                    //    }
+                    //} else if bend.len() == 0 {
+                    //    // Flat vertex. Faces on each side must be coplanar.
+                    //    if uniform && min_dot > 1.0 - Self::DOT_EPSILON {
+                    //        // TODO: Remove vertex
+                    //        println!("Redundant flat vertex: {:?}", vertex_id);
+                    //    }
+                    //}
                 }
             }
         }
@@ -263,12 +271,34 @@ impl MaterialMesh {
             min,
             max,
             halfedge_id,
-            triangulation,
+            ..
         } = range;
         let axis_id = axis as usize;
 
-        let pos = self.mesh.edge_positions(halfedge_id);
-        // We assume the edge points up, as that was enforced
+        let mut pos = self.mesh.edge_positions(halfedge_id);
+        let vertices = self.mesh.edge_vertices(halfedge_id);
+        // We assume the edge points in the +axis direction, as that was enforced
+
+        // Detect degenerate cases
+        if (slice_coord - min).abs() < Self::EPSILON {
+            pos.0[axis_id] = slice_coord;
+            self.mesh.move_vertex_to(vertices.0, pos.0);
+        }
+
+        if (slice_coord - max).abs() < Self::EPSILON {
+            pos.1[axis_id] = slice_coord;
+            self.mesh.move_vertex_to(vertices.1, pos.1);
+        }
+
+        if pos.0[axis_id] == slice_coord || pos.1[axis_id] == slice_coord {
+            // Degenerate case; abort
+            return if pos.1[axis_id] != slice_coord {
+                vec![halfedge_id]
+            } else {
+                vec![]
+            };
+        }
+
         let t = (slice_coord - min) / (max - min);
         let mut inter = vec3(
             slice_coord,
@@ -297,11 +327,10 @@ impl MaterialMesh {
 
     /// Draws contours on the mesh along evenly spaced axis-aligned planes.
     /// One of the planes crosses the origin.
-    pub fn axis_contour(&mut self, axis: Axis, spacing: f64) {
+    pub fn axis_contour(&mut self, axis: Axis, spacing: f64, min_slice: f64, max_slice: f64) {
         let axis_id = axis as usize;
-        let extreme = self.mesh.extreme_coordinates();
-        let min = (extreme.0[axis_id] / spacing + 0.5).floor() * spacing - spacing;
-        let max = (extreme.1[axis_id] / spacing + 0.5).floor() * spacing + spacing;
+        let min = min_slice;
+        let max = max_slice;
 
         // Obtain extreme coordinates of edges
         let mut ranges = self
@@ -340,7 +369,6 @@ impl MaterialMesh {
 
         let mut slice_coord = min + spacing;
 
-        // We start contouring bottom edges and move up
         while !ranges.is_empty() {
             while ranges.last().map_or(false, |r| r.min < slice_coord) {
                 if let Some(range) = ranges.pop() {
@@ -384,13 +412,18 @@ impl MaterialMesh {
     }
 
     /// Slices the mesh into regions based on the contours.
-    /// The minimum-coordinate slicing plane is also returned.
-    fn contour_slice(&self, axis: Axis, spacing: f64) -> (Vec<MaterialMesh>, f64) {
+    /// The lesser-coordinate slicing plane is also returned for each slice.
+    fn contour_slice(
+        &self,
+        axis: Axis,
+        spacing: f64,
+        min_slice: f64,
+        max_slice: f64,
+    ) -> Vec<(f64, MaterialMesh)> {
         let axis_id = axis as usize;
 
-        let extreme = self.mesh.extreme_coordinates();
-        let min = (extreme.0[axis_id] / spacing + 0.5).floor() * spacing - spacing;
-        let max = (extreme.1[axis_id] / spacing + 0.5).floor() * spacing + spacing;
+        let min = min_slice;
+        let max = max_slice;
 
         let mut imms = vec![Intermediate::default(); ((max - min) / spacing) as usize];
 
@@ -415,17 +448,19 @@ impl MaterialMesh {
             }
         }
 
-        (
-            imms.into_iter()
-                .map(|imm| {
-                    let mut positions = vec![0.0; imm.vertex_ids.len() * 3];
-                    for (vertex, index) in imm.vertex_ids {
-                        let position = self.mesh.vertex_position(vertex);
-                        positions[index * 3 + 0] = position[0];
-                        positions[index * 3 + 1] = position[1];
-                        positions[index * 3 + 2] = position[2];
-                    }
+        imms.into_iter()
+            .enumerate()
+            .map(|(i, imm)| {
+                let mut positions = vec![0.0; imm.vertex_ids.len() * 3];
+                for (vertex, index) in imm.vertex_ids {
+                    let position = self.mesh.vertex_position(vertex);
+                    positions[index * 3 + 0] = position[0];
+                    positions[index * 3 + 1] = position[1];
+                    positions[index * 3 + 2] = position[2];
+                }
 
+                (
+                    min + i as f64 * spacing,
                     MaterialMesh::new(
                         MeshBuilder::new()
                             .with_positions(positions)
@@ -433,11 +468,10 @@ impl MaterialMesh {
                             .with_tags(imm.tags)
                             .build()
                             .expect("Invalid mesh"),
-                    )
-                })
-                .collect(),
-            min,
-        )
+                    ),
+                )
+            })
+            .collect()
     }
 
     /// Slices the mesh along evenly spaced axis-aligned planes.
@@ -446,85 +480,86 @@ impl MaterialMesh {
     /// Does not use the mesh's split_at_intersection() method because
     /// the runtime can be faster in this case.
     ///
-    /// Also returns the minimum slice coordinate.
-    pub fn axis_slice(mut self, axis: Axis, spacing: f64) -> (Vec<MaterialMesh>, f64) {
-        self.axis_contour(axis, spacing);
-        let (mut slices, min) = self.contour_slice(axis, spacing);
-        for slice in slices.iter_mut() {
+    /// Also returns the lesser slice coordinate for each slice
+    pub fn axis_slice(mut self, axis: Axis, spacing: f64) -> Vec<(f64, MaterialMesh)> {
+        let extreme = self.mesh.extreme_coordinates();
+        let min = (extreme.0[axis as usize] / spacing - Self::EPSILON).floor() * spacing;
+        let max = (extreme.1[axis as usize] / spacing + Self::EPSILON).ceil() * spacing;
+
+        self.axis_contour(axis, spacing, min, max);
+        let mut slices = self.contour_slice(axis, spacing, min, max);
+        for (_, slice) in slices.iter_mut() {
             slice.decimate();
         }
-        (slices, min)
+        slices
     }
 
-    ///// Slices the mesh along evenly spaced axis-aligned planes.
-    ///// One of the planes crosses the origin.
-    ///// Slices are ordered from minimium coordinate to maximum coordinate.
-    ///// Does not use the mesh's split_at_intersection() method because
-    ///// the runtime can be faster in this case.
-    //pub fn axis_slice(&self, axis: Axis, spacing: f64) -> Vec<MaterialMesh> {
-    //    let (coarse, slice_min) = self.coarse_slice(axis, spacing);
+    /// Calculates the ranges that the faces take up along some axes
+    /// and calculates the in-out gradient of each range.
+    /// The in-out gradient is
+    /// * -1 if travelling along the +axis direction goes from outside to inside
+    /// * 0 if there is no change
+    /// * 1 if travelling along the +axis direction goes from inside to outside
+    pub fn axis_ranges_and_in_out_gradients(
+        &self,
+        axis: Axis,
+        cross_section_area: f64,
+    ) -> Vec<(f64, f64, i32)> {
+        let axis_id = axis as usize;
+        let axis_vec = axis.unit_dir();
 
-    //    let extreme = self.mesh.extreme_coordinates();
-    //    let plane_mins = [extreme.0[(axis as usize + 1) % 3], extreme.0[(axis as usize + 2) % 3]];
-    //    let plane_maxs = [extreme.1[(axis as usize + 1) % 3], extreme.1[(axis as usize + 2) % 3]];
+        let mut face_ranges = self
+            .mesh
+            .face_iter()
+            .map(|f| {
+                let pos = self.mesh.face_positions(f);
 
-    //    // Rotates the axes so the X axis moves to the Y axis
-    //    let axis_rotation = Mat3::from_cols(
-    //        vec3(0.0, 1.0, 0.0),
-    //        vec3(0.0, 0.0, 1.0),
-    //        vec3(1.0, 0.0, 0.0)
-    //    );
-    //
-    //    let mut positions = Mat3::from_cols(
-    //        vec3(slice_min, plane_mins[0] - 1.0, plane_mins[1] - 1.0),
-    //        vec3(slice_min, 2.0 * plane_maxs[0] - plane_mins[0] + 1.0, plane_mins[1] - 1.0),
-    //        vec3(slice_min, plane_mins[0] - 1.0, 2.0 * plane_maxs[1] - plane_mins[1] + 1.0),
-    //    );
+                FaceRange {
+                    min: pos.0[axis_id].min(pos.1[axis_id]).min(pos.2[axis_id]),
+                    max: pos.0[axis_id].max(pos.1[axis_id]).max(pos.2[axis_id]),
+                    face_proj_area: (pos.1 - pos.0).cross(pos.2 - pos.0).dot(axis_vec) / 2.0,
+                }
+            })
+            .collect::<Vec<_>>();
 
-    //    let mut spacing_vec = Vec3::unit_x() * spacing;
+        face_ranges.sort_by_key(|range| FloatOrd(range.min));
 
-    //    for _ in 0..axis as usize {
-    //        positions = axis_rotation * positions;
-    //        spacing_vec = axis_rotation * spacing_vec;
-    //    }
+        let mut ranges: Vec<Interval> = vec![];
 
-    //    // Construct slicing planes
-    //    let mut planes = MeshBuilder::<()>::new().with_positions(
-    //        AsRef::<[f64; 9]>::as_ref(&positions).iter().copied().collect()
-    //    ).with_indices(vec![0, 1, 2]).build().expect("Cannot build slice plane");
+        // Build the ranges and accumulate projection areas
+        for face_range in face_ranges {
+            if ranges.is_empty() || face_range.min > ranges.last().unwrap().max {
+                // New interval necessary
+                ranges.push(Interval {
+                    min: face_range.min,
+                    max: face_range.max,
+                    proj_area: face_range.face_proj_area,
+                });
+            } else {
+                // Expand old interval
+                let range = ranges.last_mut().unwrap();
+                range.max = range.max.max(face_range.max);
+                range.proj_area += face_range.face_proj_area;
+            }
+        }
 
-    //    planes.append(&planes.translated(spacing_vec));
-    //    println!("{}", planes);
-    //    let mut slice_coord = slice_min;
-    //    let mut slices = vec![];
+        ranges
+            .into_iter()
+            .map(|range| {
+                (
+                    range.min,
+                    range.max,
+                    (range.proj_area / cross_section_area).round() as i32,
+                )
+            })
+            .collect()
+    }
+}
 
-    //    // Slicing time!
-    //    for mut mesh in coarse {
-    //        let (split, _) = mesh.mesh.split_at_intersection(&mut planes.clone());
-    //
-    //        // Combine parts between the slices into 1 mesh
-    //        let mut slice = MeshBuilder::<MaterialID>::new().with_positions(vec![]).build().unwrap();
-    //        for piece in split {
-    //            let ext = piece.extreme_coordinates();
-    //            let average = (ext.0[axis as usize] + ext.1[axis as usize]) / 2.0;
-    //            if average > slice_coord && average < slice_coord + spacing {
-    //                println!("Accepted: Vertices: {}, Faces; {}", piece.num_vertices(), piece.num_faces());
-    //                slice.append(&piece);
-    //            } else {
-    //                println!("Rejected: Vertices: {}, Faces; {}", piece.num_vertices(), piece.num_faces());
-    //            }
-    //        }
-    //        println!("Vertices: {}, Faces; {}", slice.num_vertices(), slice.num_faces());
-    //        println!();
-
-    //        slices.push(MaterialMesh::new(slice));
-
-    //        planes.translate(spacing_vec);
-    //        slice_coord += spacing;
-    //    }
-
-    //    slices
-    //}
+struct Interval {
+    min: f64,
+    max: f64,
+    proj_area: f64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -532,6 +567,14 @@ pub enum Axis {
     X,
     Y,
     Z,
+}
+
+impl Axis {
+    pub fn unit_dir(self) -> Vec3 {
+        let mut vec = Vec3::zero();
+        vec[self as usize] = 1.0;
+        vec
+    }
 }
 
 #[cfg(test)]
