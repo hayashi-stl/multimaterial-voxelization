@@ -11,3 +11,4 @@ tri-mesh = { git = "https://github.com/josh65536/tri-mesh" }
 fnv = "1.0.7"
 cgmath = "0.17.0"
 float-ord = "0.2.0"
+rayon = "1.5.0"

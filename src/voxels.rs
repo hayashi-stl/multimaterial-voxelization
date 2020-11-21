@@ -1,6 +1,7 @@
 use fnv::FnvHashMap;
 use tri_mesh::prelude::*;
 use std::path::Path;
+use rayon::prelude::*;
 
 use crate::material_mesh::{Axis, MaterialID, MaterialMesh};
 
@@ -73,20 +74,51 @@ impl Voxels {
     pub fn export_debug_obj<P: AsRef<Path>>(&self, path: P) {
         let mut builder = DebugMeshBuilder::new();
         
-        for (pos, chunk) in &self.chunks {
+        for (chunk_pos, chunk) in &self.chunks {
             match chunk {
                 Chunk::Uniform(material) =>
-                    builder.add_cube(pos.cast().unwrap() * Chunk::SIZE as f64, Chunk::SIZE as f64, *material)
+                    builder.add_cube(chunk_pos.cast().unwrap() * Chunk::SIZE as f64, Chunk::SIZE as f64, *material),
+
+                Chunk::Complex(chunk) =>
+                    chunk.add_to_debug_mesh(*chunk_pos, &mut builder),
             }
         }
 
-        builder.build().export_debug_obj(path)
+        let mut output = String::from("o object\n");
+
+        let positions = &builder.positions;
+        let len = positions.len() / 3;
+        for i in 0..builder.positions.len() / 3 {
+            if (i + 1) * 100 / len > i * 100 / len {
+                println!("Vertices: {}%", (i + 1) * 100 / len);
+            }
+            output += &format!("v {} {} {}\n", positions[i*3], positions[i*3 + 1], positions[i*3 + 2]);
+        }
+
+        let indexes = &builder.indexes;
+        let len = indexes.len() / 3;
+        for i in 0..builder.indexes.len() / 3 {
+            if (i + 1) * 100 / len > i * 100 / len {
+                println!("Faces: {}%", (i + 1) * 100 / len);
+            }
+
+            let mut face = String::new();
+            for j in 0..3 {
+                let index = indexes[i*3 + j] + 1;
+                face += &format!(" {}", index);
+            }
+            output += &format!("f{}\n", face);
+        }
+
+        std::fs::write(path, output).expect("Could not debug obj");
+
+        //builder.build().export_debug_obj(path)
     }
 
     fn fill_uniform_chunks(&mut self, ranges_yz: Vec<(f64, f64, Vec<(f64, f64, i32)>)>) {
         for (y, z, ranges) in &ranges_yz {
-            let chunk_y = *y as i32 / Chunk::SIZE as i32;
-            let chunk_z = *z as i32 / Chunk::SIZE as i32;
+            let chunk_y = (*y as i32).div_euclid(Chunk::SIZE as i32);
+            let chunk_z = (*z as i32).div_euclid(Chunk::SIZE as i32);
             let mut inside = 0;
             let mut start = 0;
 
@@ -108,14 +140,67 @@ impl Voxels {
             }
         }
     }
+
+    fn ranges_to_complex_chunks(&self, ranges_yz: Vec<(f64, f64, Vec<(f64, f64, i32)>)>) -> FnvHashMap<Vec3i, Chunk> {
+        let mut chunks: FnvHashMap<Vec3i, ComplexChunk> = FnvHashMap::default();
+        let mut dummy = ComplexChunk::new();
+        let chunk_size = Chunk::SIZE as i32;
+
+        for (y, z, ranges) in &ranges_yz {
+            let chunk_y = (*y as i32).div_euclid(chunk_size);
+            let chunk_z = (*z as i32).div_euclid(chunk_size);
+            let mod_y = (*y as i32).rem_euclid(chunk_size);
+            let mod_z = (*z as i32).rem_euclid(chunk_size);
+
+            let mut inside = 0;
+            let mut start = 0i32;
+
+            let mut chunk = &mut dummy;
+
+            for (min, max, grad) in ranges {
+                if inside != 0 {
+                    let end = min.floor() as i32;
+
+                    let mut x = start;
+
+                    while x < end {
+                        // Chunk change!
+                        if x == start || x.rem_euclid(chunk_size) == 0 {
+                            // Skip over uniform chunks
+                            if self.chunks.contains_key(&vec3(x.div_euclid(chunk_size), chunk_y, chunk_z)) {
+                                x = (x + chunk_size).div_euclid(chunk_size) * chunk_size;
+                                continue;
+                            }
+
+                            chunk = chunks
+                                .entry(vec3(x.div_euclid(chunk_size), chunk_y, chunk_z))
+                                .or_insert(ComplexChunk::new());
+                        }
+
+                        *chunk.voxel_mut(vec3(x.rem_euclid(chunk_size), mod_y, mod_z)) =
+                            Voxel::Pure(Some(MaterialID::new(1)));
+                        x += 1;
+                    }
+                }
+
+                inside = (inside + grad).rem_euclid(2);
+                start = max.ceil() as i32;
+            }
+        }
+        
+        chunks.into_iter()
+            .map(|(k, v)| (k, Chunk::Complex(v)))
+            .collect()
+    }
 }
 
 impl From<MaterialMesh> for Voxels {
     fn from(mesh: MaterialMesh) -> Self {
+        // Uniform chunks
         let slices = mesh.axis_slice(Axis::Z, Chunk::SIZE as f64);
-        let slices = slices
-            .into_iter()
-            .flat_map(|(z, slice)| {
+        let mut slices: Vec<(f64, f64, MaterialMesh)> = slices
+            .into_par_iter()
+            .flat_map_iter(|(z, slice)| {
                 slice
                     .axis_slice(Axis::Y, Chunk::SIZE as f64)
                     .into_iter()
@@ -125,11 +210,12 @@ impl From<MaterialMesh> for Voxels {
 
         // Obtain ranges as a map from (y, z) coords to a vector of (min, max, in-out gradient) tuples
         let ranges_yz = slices
-            .into_iter()
+            // Using mutable reference only because MaterialMesh is not Sync
+            .par_iter_mut()
             .map(|(y, z, slice)| {
                 (
-                    y,
-                    z,
+                    *y,
+                    *z,
                     slice.axis_ranges_and_in_out_gradients(
                         Axis::X,
                         (Chunk::SIZE * Chunk::SIZE) as f64,
@@ -142,6 +228,33 @@ impl From<MaterialMesh> for Voxels {
 
         voxels.fill_uniform_chunks(ranges_yz);
 
+        // Pure voxels
+        let complex_chunks = slices
+            .into_par_iter()
+            .flat_map_iter(|(chunk_y, chunk_z, slice)| {
+                let mut slices: Vec<(f64, f64, MaterialMesh)> = slice.axis_slice(Axis::Z, 1.0).into_iter()
+                    .flat_map(|(z, slice)| slice.axis_slice(Axis::Y, 1.0).into_iter()
+                        .map(move |(y, slice)| (y, z, slice)))
+                    .collect::<Vec<_>>();
+
+                let ranges_yz = slices
+                    // Using mutable reference only because MaterialMesh is not Sync
+                    .par_iter_mut()
+                    .map(|(y, z, slice)| {
+                        (
+                            *y,
+                            *z,
+                            slice.axis_ranges_and_in_out_gradients(Axis::X, 1.0),
+                        )
+                    })
+                    .collect::<Vec<_>>();
+
+                voxels.ranges_to_complex_chunks(ranges_yz).into_iter()
+            })
+            .collect::<Vec<_>>();
+
+        voxels.chunks.extend(complex_chunks.into_iter());
+
         voxels
     }
 }
@@ -150,6 +263,7 @@ impl From<MaterialMesh> for Voxels {
 #[derive(Clone, Debug)]
 pub enum Chunk {
     Uniform(MaterialID),
+    Complex(ComplexChunk),
 }
 
 impl Chunk {
@@ -163,10 +277,45 @@ pub struct ComplexChunk {
     complex: Vec<ComplexVoxel>,
 }
 
+impl ComplexChunk {
+    fn new() -> Self {
+        Self {
+            voxels: [Voxel::Pure(None); Chunk::SIZE * Chunk::SIZE * Chunk::SIZE],
+            complex: vec![]
+        }
+    }
+
+    fn add_to_debug_mesh(&self, chunk_pos: Vec3i, builder: &mut DebugMeshBuilder) {
+        for z in 0..Chunk::SIZE as i32 {
+            for y in 0..Chunk::SIZE as i32 {
+                for x in 0..Chunk::SIZE as i32 {
+                    if let Voxel::Pure(Some(mat)) = self.voxel(vec3(x, y, z)) {
+                        builder.add_cube((chunk_pos * Chunk::SIZE as i32 + vec3(x, y, z)).cast().unwrap(), 1.0, mat);
+                    }
+                }
+            }
+        }
+    }
+
+    fn offset_to_index(offset: Vec3i) -> usize {
+        (offset.z as usize * Chunk::SIZE + offset.y as usize) * Chunk::SIZE + offset.x as usize
+    }
+
+    /// Get the voxel at a certain offset in the chunk
+    pub fn voxel(&self, offset: Vec3i) -> Voxel {
+        self.voxels[Self::offset_to_index(offset)]
+    }
+
+    /// Get a mutable reference to the voxel at a certain offset in the chunk
+    pub fn voxel_mut(&mut self, offset: Vec3i) -> &mut Voxel {
+        &mut self.voxels[Self::offset_to_index(offset)]
+    }
+}
+
 /// A complex chunk entry. Can be a pure voxel or an index to a complex voxel
 #[derive(Copy, Clone, Debug)]
 pub enum Voxel {
-    Pure(MaterialID),
+    Pure(Option<MaterialID>),
     Complex(u32),
 }
 
