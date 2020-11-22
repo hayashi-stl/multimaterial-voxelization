@@ -370,9 +370,14 @@ impl MaterialMesh {
         let mut slice_coord = min + spacing;
 
         while !ranges.is_empty() {
-            while ranges.last().map_or(false, |r| r.min < slice_coord) {
+            // Add epsilons so the edge-slicing code can deal with
+            // edges that come EXTEREMELY close to slice planes but don't quite reach
+            while ranges
+                .last()
+                .map_or(false, |r| r.min - Self::EPSILON < slice_coord)
+            {
                 if let Some(range) = ranges.pop() {
-                    if range.max > slice_coord {
+                    if range.max + Self::EPSILON > slice_coord {
                         if range.triangulation {
                             &mut tri_edges
                         } else {
@@ -553,6 +558,22 @@ impl MaterialMesh {
                 )
             })
             .collect()
+    }
+
+    /// Moves any vertices that are very close to slice planes
+    /// onto the slice planes.
+    /// This should be called before getting the ranges of the faces
+    /// to avoid close calls of complex voxels that should be pure voxels.
+    pub fn align_with_slice_planes(&mut self, axis: Axis, spacing: f64) {
+        for vertex_id in self.mesh.vertex_iter() {
+            let mut pos = self.mesh.vertex_position(vertex_id);
+            let slice_plane = (pos[axis as usize] / spacing).round() * spacing;
+
+            if (slice_plane - pos[axis as usize]).abs() < Self::EPSILON {
+                pos[axis as usize] = slice_plane;
+                self.mesh.move_vertex_to(vertex_id, pos);
+            }
+        }
     }
 }
 

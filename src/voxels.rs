@@ -1,7 +1,7 @@
 use fnv::FnvHashMap;
-use tri_mesh::prelude::*;
-use std::path::Path;
 use rayon::prelude::*;
+use std::path::Path;
+use tri_mesh::prelude::*;
 
 use crate::material_mesh::{Axis, MaterialID, MaterialMesh};
 
@@ -27,10 +27,14 @@ impl DebugMeshBuilder {
     /// Add a cube given min coordinates, side length, and material
     fn add_cube(&mut self, min: Vec3, length: f64, material: MaterialID) {
         let offset = self.positions.len() / 3;
-        self.indexes.extend(vec![
-            2, 6, 4, 4, 0, 2, 6, 7, 5, 5, 4, 6, 7, 3, 1, 1, 5, 7,
-            3, 2, 0, 0, 1, 3, 0, 4, 5, 5, 1, 0, 2, 3, 7, 7, 6, 2,
-        ].into_iter().map(|i| offset as u32 + i));
+        self.indexes.extend(
+            vec![
+                2, 6, 4, 4, 0, 2, 6, 7, 5, 5, 4, 6, 7, 3, 1, 1, 5, 7, 3, 2, 0, 0, 1, 3, 0, 4, 5, 5,
+                1, 0, 2, 3, 7, 7, 6, 2,
+            ]
+            .into_iter()
+            .map(|i| offset as u32 + i),
+        );
 
         for z in 0..2 {
             for y in 0..2 {
@@ -54,7 +58,7 @@ impl DebugMeshBuilder {
                 .with_indices(self.indexes)
                 .with_tags(self.materials)
                 .build()
-                .expect("Invalid mesh")
+                .expect("Invalid mesh"),
         )
     }
 }
@@ -73,14 +77,16 @@ impl Voxels {
     /// Export this voxelization as an obj for debugging
     pub fn export_debug_obj<P: AsRef<Path>>(&self, path: P) {
         let mut builder = DebugMeshBuilder::new();
-        
+
         for (chunk_pos, chunk) in &self.chunks {
             match chunk {
-                Chunk::Uniform(material) =>
-                    builder.add_cube(chunk_pos.cast().unwrap() * Chunk::SIZE as f64, Chunk::SIZE as f64, *material),
+                Chunk::Uniform(material) => builder.add_cube(
+                    chunk_pos.cast().unwrap() * Chunk::SIZE as f64,
+                    Chunk::SIZE as f64,
+                    *material,
+                ),
 
-                Chunk::Complex(chunk) =>
-                    chunk.add_to_debug_mesh(*chunk_pos, &mut builder),
+                Chunk::Complex(chunk) => chunk.add_to_debug_mesh(*chunk_pos, &mut builder),
             }
         }
 
@@ -90,21 +96,26 @@ impl Voxels {
         let len = positions.len() / 3;
         for i in 0..builder.positions.len() / 3 {
             if (i + 1) * 100 / len > i * 100 / len {
-                println!("Vertices: {}%", (i + 1) * 100 / len);
+                //println!("Vertices: {}%", (i + 1) * 100 / len);
             }
-            output += &format!("v {} {} {}\n", positions[i*3], positions[i*3 + 1], positions[i*3 + 2]);
+            output += &format!(
+                "v {} {} {}\n",
+                positions[i * 3],
+                positions[i * 3 + 1],
+                positions[i * 3 + 2]
+            );
         }
 
         let indexes = &builder.indexes;
         let len = indexes.len() / 3;
         for i in 0..builder.indexes.len() / 3 {
             if (i + 1) * 100 / len > i * 100 / len {
-                println!("Faces: {}%", (i + 1) * 100 / len);
+                //println!("Faces: {}%", (i + 1) * 100 / len);
             }
 
             let mut face = String::new();
             for j in 0..3 {
-                let index = indexes[i*3 + j] + 1;
+                let index = indexes[i * 3 + j] + 1;
                 face += &format!(" {}", index);
             }
             output += &format!("f{}\n", face);
@@ -141,7 +152,10 @@ impl Voxels {
         }
     }
 
-    fn ranges_to_complex_chunks(&self, ranges_yz: Vec<(f64, f64, Vec<(f64, f64, i32)>)>) -> FnvHashMap<Vec3i, Chunk> {
+    fn ranges_to_complex_chunks(
+        &self,
+        ranges_yz: Vec<(f64, f64, Vec<(f64, f64, i32)>)>,
+    ) -> FnvHashMap<Vec3i, Chunk> {
         let mut chunks: FnvHashMap<Vec3i, ComplexChunk> = FnvHashMap::default();
         let mut dummy = ComplexChunk::new();
         let chunk_size = Chunk::SIZE as i32;
@@ -167,7 +181,11 @@ impl Voxels {
                         // Chunk change!
                         if x == start || x.rem_euclid(chunk_size) == 0 {
                             // Skip over uniform chunks
-                            if self.chunks.contains_key(&vec3(x.div_euclid(chunk_size), chunk_y, chunk_z)) {
+                            if self.chunks.contains_key(&vec3(
+                                x.div_euclid(chunk_size),
+                                chunk_y,
+                                chunk_z,
+                            )) {
                                 x = (x + chunk_size).div_euclid(chunk_size) * chunk_size;
                                 continue;
                             }
@@ -187,8 +205,9 @@ impl Voxels {
                 start = max.ceil() as i32;
             }
         }
-        
-        chunks.into_iter()
+
+        chunks
+            .into_iter()
             .map(|(k, v)| (k, Chunk::Complex(v)))
             .collect()
     }
@@ -213,6 +232,7 @@ impl From<MaterialMesh> for Voxels {
             // Using mutable reference only because MaterialMesh is not Sync
             .par_iter_mut()
             .map(|(y, z, slice)| {
+                slice.align_with_slice_planes(Axis::X, Chunk::SIZE as f64);
                 (
                     *y,
                     *z,
@@ -232,20 +252,30 @@ impl From<MaterialMesh> for Voxels {
         let complex_chunks = slices
             .into_par_iter()
             .flat_map_iter(|(chunk_y, chunk_z, slice)| {
-                let mut slices: Vec<(f64, f64, MaterialMesh)> = slice.axis_slice(Axis::Z, 1.0).into_iter()
-                    .flat_map(|(z, slice)| slice.axis_slice(Axis::Y, 1.0).into_iter()
-                        .map(move |(y, slice)| (y, z, slice)))
+                let mut slices: Vec<(f64, f64, MaterialMesh)> = slice
+                    .axis_slice(Axis::Z, 1.0)
+                    .into_iter()
+                    .flat_map(|(z, slice)| {
+                        slice
+                            .axis_slice(Axis::Y, 1.0)
+                            .into_iter()
+                            .map(move |(y, slice)| (y, z, slice))
+                    })
                     .collect::<Vec<_>>();
 
                 let ranges_yz = slices
                     // Using mutable reference only because MaterialMesh is not Sync
                     .par_iter_mut()
                     .map(|(y, z, slice)| {
-                        (
-                            *y,
-                            *z,
-                            slice.axis_ranges_and_in_out_gradients(Axis::X, 1.0),
-                        )
+                        //if *y == 41.0 && *z == -6.0 {
+                        //    slice.export_debug_obj("assets/debug/slice_41_-6.obj");
+                        //}
+                        slice.align_with_slice_planes(Axis::X, 1.0);
+                        let res = (*y, *z, slice.axis_ranges_and_in_out_gradients(Axis::X, 1.0));
+                        if *y == 41.0 && *z == -6.0 {
+                            dbg!(&res);
+                        }
+                        res
                     })
                     .collect::<Vec<_>>();
 
@@ -281,7 +311,7 @@ impl ComplexChunk {
     fn new() -> Self {
         Self {
             voxels: [Voxel::Pure(None); Chunk::SIZE * Chunk::SIZE * Chunk::SIZE],
-            complex: vec![]
+            complex: vec![],
         }
     }
 
@@ -290,7 +320,34 @@ impl ComplexChunk {
             for y in 0..Chunk::SIZE as i32 {
                 for x in 0..Chunk::SIZE as i32 {
                     if let Voxel::Pure(Some(mat)) = self.voxel(vec3(x, y, z)) {
-                        builder.add_cube((chunk_pos * Chunk::SIZE as i32 + vec3(x, y, z)).cast().unwrap(), 1.0, mat);
+                        // Cheaply remove landlocked voxels
+                        if vec![
+                            vec3(1, 0, 0),
+                            vec3(-1, 0, 0),
+                            vec3(0, 1, 0),
+                            vec3(0, -1, 0),
+                            vec3(0, 0, 1),
+                            vec3(0, 0, -1),
+                        ]
+                        .into_iter()
+                        .any(|vec| {
+                            let vec = vec + vec3(x, y, z);
+                            vec.x < 0
+                                || vec.x >= Chunk::SIZE as i32
+                                || vec.y < 0
+                                || vec.y >= Chunk::SIZE as i32
+                                || vec.z < 0
+                                || vec.z >= Chunk::SIZE as i32
+                                || self.voxel(vec).is_empty()
+                        }) {
+                            builder.add_cube(
+                                (chunk_pos * Chunk::SIZE as i32 + vec3(x, y, z))
+                                    .cast()
+                                    .unwrap(),
+                                1.0,
+                                mat,
+                            );
+                        }
                     }
                 }
             }
@@ -317,6 +374,16 @@ impl ComplexChunk {
 pub enum Voxel {
     Pure(Option<MaterialID>),
     Complex(u32),
+}
+
+impl Voxel {
+    /// Checks if a voxel is empty
+    pub fn is_empty(self) -> bool {
+        match self {
+            Voxel::Pure(optional) => optional.is_none(),
+            Voxel::Complex(_) => false,
+        }
+    }
 }
 
 /// A complex voxel, including inner vertices and hulls.
