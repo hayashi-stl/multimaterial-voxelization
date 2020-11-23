@@ -1,5 +1,6 @@
 extern crate cgmath;
 extern crate float_ord;
+extern crate petgraph;
 extern crate rayon;
 extern crate tri_mesh;
 

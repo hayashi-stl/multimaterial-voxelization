@@ -1,5 +1,7 @@
 use float_ord::FloatOrd;
 use fnv::FnvHashMap;
+use petgraph::prelude::*;
+use petgraph::visit::IntoEdgeReferences;
 use std::fs;
 use std::num::NonZeroU32;
 use std::path::Path;
@@ -455,6 +457,7 @@ impl MaterialMesh {
 
         imms.into_iter()
             .enumerate()
+            .filter(|(i, imm)| imm.vertex_ids.len() > 0)
             .map(|(i, imm)| {
                 let mut positions = vec![0.0; imm.vertex_ids.len() * 3];
                 for (vertex, index) in imm.vertex_ids {
@@ -575,6 +578,53 @@ impl MaterialMesh {
             }
         }
     }
+
+    /// Gets a graph of the boundary, with correct
+    /// winding direction on the edges
+    fn boundary_graph(&self) -> Graph<(VertexID, Vec3), ()> {
+        let mut graph = Graph::new();
+        let mut indexes = FnvHashMap::default();
+
+        for vertex in self.mesh.vertex_iter() {
+            if self.mesh.is_vertex_on_boundary(vertex) {
+                let pos = self.mesh.vertex_position(vertex);
+                let index = graph.add_node((vertex, pos));
+                indexes.insert(vertex, index);
+            }
+        }
+
+        for halfedge in self.mesh.halfedge_iter() {
+            if self.mesh.is_edge_on_boundary(halfedge)
+                && self.mesh.walker_from_halfedge(halfedge).face_id().is_some()
+            {
+                let vtx = self.mesh.edge_vertices(halfedge);
+                graph.add_edge(indexes[&vtx.0], indexes[&vtx.1], ());
+            }
+        }
+
+        graph
+    }
+
+    /// Gets the intersection of a unit cube
+    /// and a manifold mesh potentially with boundary.
+    /// It is assumed that the mesh's boundary is entirely
+    /// on the surface of the cube and that no triangles
+    /// are coplanar with a cube face.
+    pub fn intersect_unit_cube(mut self, cube_min: Vec3) -> Self {
+        self.mesh.translate(-cube_min);
+
+        // Fill in all 6 squares appropriately
+        for normal in vec![
+            Vec3::unit_x(),
+            -Vec3::unit_x(),
+            Vec3::unit_y(),
+            -Vec3::unit_y(),
+            Vec3::unit_z(),
+            -Vec3::unit_z(),
+        ] {}
+
+        self
+    }
 }
 
 struct Interval {
@@ -601,17 +651,46 @@ impl Axis {
 #[cfg(test)]
 mod test {
     use super::*;
-    #[test]
-    fn test_dissolve_boundary_vertex_simple() {
-        let mut mesh = MaterialMesh {
+    use petgraph::algo;
+    use petgraph::data::{Element, FromElements};
+
+    fn graph_from_mesh(
+        mesh: &MaterialMesh,
+        vertices: Vec<usize>,
+        edges: Vec<(usize, usize)>,
+    ) -> Graph<(VertexID, Vec3), ()> {
+        let v = mesh.mesh.vertex_iter().collect::<Vec<_>>();
+
+        Graph::from_elements(
+            vertices
+                .into_iter()
+                .map(|vertex| Element::Node {
+                    weight: (v[vertex], mesh.mesh.vertex_position(v[vertex])),
+                })
+                .chain(edges.into_iter().map(|(s, t)| Element::Edge {
+                    source: s,
+                    target: t,
+                    weight: (),
+                })),
+        )
+    }
+
+    fn create_mesh(positions: Vec<f64>, indexes: Vec<u32>) -> MaterialMesh {
+        MaterialMesh {
             mesh: MeshBuilder::<MaterialID>::new()
-                .with_positions(vec![
-                    0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 2.0, 0.0, 0.0, 1.5, 1.0, 0.0,
-                ])
-                .with_indices(vec![0, 1, 3, 3, 1, 2])
+                .with_positions(positions)
+                .with_indices(indexes)
                 .build()
                 .expect("Invalid mesh"),
-        };
+        }
+    }
+
+    #[test]
+    fn test_dissolve_boundary_vertex_simple() {
+        let mut mesh = create_mesh(
+            vec![0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 2.0, 0.0, 0.0, 1.5, 1.0, 0.0],
+            vec![0, 1, 3, 3, 1, 2],
+        );
 
         let vertex = mesh.mesh.vertex_iter().collect::<Vec<_>>()[1];
         mesh.dissolve_boundary_vertex(vertex);
@@ -627,15 +706,12 @@ mod test {
 
     #[test]
     fn test_dissolve_boundary_vertex_multiple_inner() {
-        let mut mesh = MaterialMesh {
-            mesh: MeshBuilder::<MaterialID>::new()
-                .with_positions(vec![
-                    0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 2.0, 0.0, 0.0, 1.5, 1.0, 0.0, 1.0, 1.0, 0.0,
-                ])
-                .with_indices(vec![0, 1, 4, 4, 1, 3, 3, 1, 2])
-                .build()
-                .expect("Invalid mesh"),
-        };
+        let mut mesh = create_mesh(
+            vec![
+                0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 2.0, 0.0, 0.0, 1.5, 1.0, 0.0, 1.0, 1.0, 0.0,
+            ],
+            vec![0, 1, 4, 4, 1, 3, 3, 1, 2],
+        );
 
         let vertex = mesh.mesh.vertex_iter().collect::<Vec<_>>()[1];
         mesh.dissolve_boundary_vertex(vertex);
@@ -672,16 +748,13 @@ mod test {
 
     #[test]
     fn test_dissolve_boundary_vertex_concave() {
-        let mut mesh = MaterialMesh {
-            mesh: MeshBuilder::<MaterialID>::new()
-                .with_positions(vec![
-                    0.0, 0.0, 0.0, 3.0, 0.0, 0.0, 6.0, 0.0, 0.0, 4.0, 1.0, 0.0, 3.0, 3.0, 0.0, 2.0,
-                    1.0, 0.0,
-                ])
-                .with_indices(vec![0, 1, 5, 5, 1, 4, 4, 1, 3, 3, 1, 2])
-                .build()
-                .expect("Invalid mesh"),
-        };
+        let mut mesh = create_mesh(
+            vec![
+                0.0, 0.0, 0.0, 3.0, 0.0, 0.0, 6.0, 0.0, 0.0, 4.0, 1.0, 0.0, 3.0, 3.0, 0.0, 2.0,
+                1.0, 0.0,
+            ],
+            vec![0, 1, 5, 5, 1, 4, 4, 1, 3, 3, 1, 2],
+        );
 
         let v = mesh.mesh.vertex_iter().collect::<Vec<_>>();
         mesh.dissolve_boundary_vertex(v[1]);
@@ -697,5 +770,83 @@ mod test {
                 .contains(&v[5]),
             "Triangulation doesn't respect concave vertices"
         );
+    }
+
+    #[test]
+    fn test_boundary_graph_triangle() {
+        let mesh = create_mesh(
+            vec![0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0],
+            vec![0, 1, 2],
+        );
+
+        let graph = mesh.boundary_graph();
+        let expected = graph_from_mesh(&mesh, vec![0, 1, 2], vec![(0, 1), (2, 0), (1, 2)]);
+        assert!(algo::is_isomorphic_matching(
+            &graph,
+            &expected,
+            |x, y| x == y,
+            |x, y| x == y
+        ));
+    }
+
+    #[test]
+    fn test_boundary_graph_square() {
+        let mesh = create_mesh(
+            vec![0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 1.0, 1.0, 0.0],
+            vec![0, 1, 2, 3, 2, 1],
+        );
+
+        let graph = mesh.boundary_graph();
+        let expected = graph_from_mesh(
+            &mesh,
+            vec![0, 1, 2, 3],
+            vec![(0, 1), (1, 3), (3, 2), (2, 0)],
+        );
+        assert!(algo::is_isomorphic_matching(
+            &graph,
+            &expected,
+            |x, y| x == y,
+            |x, y| x == y
+        ));
+    }
+
+    #[test]
+    fn test_boundary_graph_poked_square() {
+        let mesh = create_mesh(
+            vec![
+                0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 1.0, 1.0, 0.0, 0.5, 0.5, 0.0,
+            ],
+            vec![0, 4, 2, 2, 4, 3, 3, 4, 1, 1, 4, 0],
+        );
+
+        let graph = mesh.boundary_graph();
+        let expected = graph_from_mesh(
+            &mesh,
+            vec![0, 1, 2, 3],
+            vec![(0, 1), (1, 3), (3, 2), (2, 0)],
+        );
+        assert!(algo::is_isomorphic_matching(
+            &graph,
+            &expected,
+            |x, y| x == y,
+            |x, y| x == y
+        ));
+    }
+
+    #[test]
+    fn test_boundary_graph_no_boundary() {
+        let mesh = create_mesh(
+            vec![0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
+            vec![1, 0, 2, 2, 0, 3, 3, 0, 1, 1, 2, 3],
+        );
+
+        let graph = mesh.boundary_graph();
+        let expected = graph_from_mesh(&mesh, vec![], vec![]);
+        assert!(algo::is_isomorphic_matching(
+            &graph,
+            &expected,
+            |x, y| x == y,
+            |x, y| x == y
+        ));
     }
 }

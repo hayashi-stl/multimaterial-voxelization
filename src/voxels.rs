@@ -152,10 +152,18 @@ impl Voxels {
         }
     }
 
+    fn add_complex_voxels_to_chunks(
+        &self,
+        slices: Vec<(Vec3, MaterialMesh)>,
+        chunks: FnvHashMap<Vec3i, ComplexChunk>,
+    ) -> FnvHashMap<Vec3i, ComplexChunk> {
+        chunks
+    }
+
     fn ranges_to_complex_chunks(
         &self,
         ranges_yz: Vec<(f64, f64, Vec<(f64, f64, i32)>)>,
-    ) -> FnvHashMap<Vec3i, Chunk> {
+    ) -> FnvHashMap<Vec3i, ComplexChunk> {
         let mut chunks: FnvHashMap<Vec3i, ComplexChunk> = FnvHashMap::default();
         let mut dummy = ComplexChunk::new();
         let chunk_size = Chunk::SIZE as i32;
@@ -207,9 +215,6 @@ impl Voxels {
         }
 
         chunks
-            .into_iter()
-            .map(|(k, v)| (k, Chunk::Complex(v)))
-            .collect()
     }
 }
 
@@ -248,7 +253,7 @@ impl From<MaterialMesh> for Voxels {
 
         voxels.fill_uniform_chunks(ranges_yz);
 
-        // Pure voxels
+        // Pure/complex voxels
         let complex_chunks = slices
             .into_par_iter()
             .flat_map_iter(|(chunk_y, chunk_z, slice)| {
@@ -265,21 +270,28 @@ impl From<MaterialMesh> for Voxels {
 
                 let ranges_yz = slices
                     // Using mutable reference only because MaterialMesh is not Sync
-                    .par_iter_mut()
+                    .iter_mut()
                     .map(|(y, z, slice)| {
-                        //if *y == 41.0 && *z == -6.0 {
-                        //    slice.export_debug_obj("assets/debug/slice_41_-6.obj");
-                        //}
                         slice.align_with_slice_planes(Axis::X, 1.0);
-                        let res = (*y, *z, slice.axis_ranges_and_in_out_gradients(Axis::X, 1.0));
-                        if *y == 41.0 && *z == -6.0 {
-                            dbg!(&res);
-                        }
-                        res
+                        (*y, *z, slice.axis_ranges_and_in_out_gradients(Axis::X, 1.0))
                     })
                     .collect::<Vec<_>>();
 
-                voxels.ranges_to_complex_chunks(ranges_yz).into_iter()
+                let chunks = voxels.ranges_to_complex_chunks(ranges_yz);
+
+                let slices = slices
+                    .into_iter()
+                    .flat_map(|(y, z, slice)| {
+                        slice
+                            .axis_slice(Axis::X, 1.0)
+                            .into_iter()
+                            .map(move |(x, slice)| (vec3(x, y, z), slice))
+                    })
+                    .collect::<Vec<_>>();
+
+                let chunks = voxels.add_complex_voxels_to_chunks(slices, chunks);
+
+                chunks.into_iter().map(|(k, v)| (k, Chunk::Complex(v)))
             })
             .collect::<Vec<_>>();
 
