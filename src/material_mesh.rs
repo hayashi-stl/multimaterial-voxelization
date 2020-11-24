@@ -1,12 +1,14 @@
 use float_ord::FloatOrd;
 use fnv::FnvHashMap;
+use petgraph::graph::Edges;
 use petgraph::prelude::*;
-use petgraph::visit::IntoEdgeReferences;
 use std::fs;
 use std::num::NonZeroU32;
 use std::path::Path;
 use tri_mesh::mesh_builder;
 use tri_mesh::prelude::*;
+
+use crate::util::{Degree, HashVec2, Vec2};
 
 /// The ID type for a material
 /// 0 is reserved for the absence of a material
@@ -581,14 +583,14 @@ impl MaterialMesh {
 
     /// Gets a graph of the boundary, with correct
     /// winding direction on the edges
-    fn boundary_graph(&self) -> Graph<(VertexID, Vec3), ()> {
+    fn boundary_graph(&self) -> Graph<Vec3, ()> {
         let mut graph = Graph::new();
         let mut indexes = FnvHashMap::default();
 
         for vertex in self.mesh.vertex_iter() {
             if self.mesh.is_vertex_on_boundary(vertex) {
                 let pos = self.mesh.vertex_position(vertex);
-                let index = graph.add_node((vertex, pos));
+                let index = graph.add_node(pos);
                 indexes.insert(vertex, index);
             }
         }
@@ -605,15 +607,234 @@ impl MaterialMesh {
         graph
     }
 
+    /// Combine vertices with equal positions on the boundary graph.
+    /// Also removes resulting self-loops.
+    fn combine_equal_vertices(boundary: &Graph<Vec2, ()>) -> Graph<Vec2, ()> {
+        let mut res = Graph::new();
+
+        let mut position_map = FnvHashMap::default();
+
+        for node in boundary.node_indices() {
+            position_map
+                .entry(HashVec2(boundary[node]))
+                .or_insert_with(|| res.add_node(boundary[node]));
+        }
+
+        for edge in boundary.edge_indices() {
+            let nodes = boundary.edge_endpoints(edge).unwrap();
+            let index0 = position_map[&HashVec2(boundary[nodes.0])];
+            let index1 = position_map[&HashVec2(boundary[nodes.1])];
+            if index0 != index1 {
+                res.update_edge(index0, index1, ());
+            }
+        }
+
+        res
+    }
+
+    fn intersect_center_unit_square_on_graph(boundary: &mut Graph<Vec2, ()>) {
+        // Ignore parts of the boundary that are also part of the boundary *of* the square
+        // and go counterclockwise around it.
+        // Boundary must be clockwise so it can be filled with a counterclockwise region.
+        let mut ignored = false;
+        boundary.retain_edges(|sub, e| {
+            let (v0, v1) = sub.edge_endpoints(e).unwrap();
+            let pos0 = sub[v0];
+            let pos1 = sub[v1];
+
+            // Edge is on boundary of face if at least 1 coordinate is ±0.5 and the same
+            if ((pos0[0].abs() == 0.5 && pos0[0] == pos1[0])
+                || (pos0[1].abs() == 0.5 && pos0[1] == pos1[1]))
+                && pos0.perp_dot(pos1) > 0.0
+            {
+                ignored = true;
+                false
+            } else {
+                true
+            }
+        });
+
+        // There may be lone vertices. Remove those
+        boundary.retain_nodes(|sub, n| sub.indegree(n) + sub.outdegree(n) > 0);
+
+        // If there's nothing left and there were counterclockwise edges on the face's boundary,
+        // the square is not part of the intersection at all.
+        if ignored && boundary.edge_count() == 0 {
+            return;
+        }
+
+        // Now for clockwise square-boundary edges.
+        // Importantly, don't remove lone vertices afterward
+        // to prevent 0-area holes from showing up.
+        ignored = false;
+        boundary.retain_edges(|sub, e| {
+            let (v0, v1) = sub.edge_endpoints(e).unwrap();
+            let pos0 = sub[v0];
+            let pos1 = sub[v1];
+
+            // Edge is on boundary of face if at least 1 coordinate is ±0.5 and the same
+            if (pos0[0].abs() == 0.5 && pos0[0] == pos1[0])
+                || (pos0[1].abs() == 0.5 && pos0[1] == pos1[1])
+            {
+                ignored = true;
+                false
+            } else {
+                true
+            }
+        });
+
+        *boundary = Self::combine_equal_vertices(boundary);
+
+        let mut node_map = boundary
+            .node_indices()
+            .map(|n| (HashVec2(boundary[n]), n))
+            .collect::<FnvHashMap<_, _>>();
+
+        // Find and order boundary points, including square corners
+        let mut points = vec![
+            vec2(-0.5, -0.5),
+            vec2(-0.5, 0.5),
+            vec2(0.5, 0.5),
+            vec2(0.5, -0.5),
+        ]
+        .into_iter()
+        .chain(
+            boundary
+                .node_weights_mut()
+                .filter(|pos| pos[0].abs() == 0.5 || pos[1].abs() == 0.5)
+                .map(|pos| *pos),
+        )
+        .collect::<Vec<_>>();
+
+        points.sort_by_key(|pos| {
+            FloatOrd(if pos[0] == -0.5 {
+                0.5 + pos[1]
+            } else if pos[1] == 0.5 {
+                1.5 + pos[0]
+            } else if pos[0] == 0.5 {
+                2.5 - pos[1]
+            } else if pos[1] == -0.5 {
+                3.5 - pos[0]
+            } else {
+                unreachable!()
+            })
+        });
+
+        // Finds the minimum dot product between the given vec and given edges
+        let dot_fn = |graph: &Graph<Vec2, ()>, vec: Vec2, edges: Edges<(), Directed>| {
+            edges
+                .map(|edge| FloatOrd(vec.dot(graph[edge.target()] - graph[edge.source()])))
+                .min()
+                .map(|f| f.0)
+        };
+
+        // Find where to start drawing the square.
+        // Look for an odd-degree vertex that needs an outgoing edge as a priority.
+        //
+        // If it's an even-degree vertex, there are only even-degree vertices.
+        // Do a special check to determine whether a square should be drawn.
+        //
+        // If there's no edges left and there were clockwise edges on the face's boundary,
+        // the entire square is the intersection.
+        let index = points
+            .iter()
+            .position(|pos| {
+                node_map
+                    .get(&HashVec2(*pos))
+                    .map(|n| boundary.outdegree(*n) < boundary.indegree(*n))
+                    .unwrap_or(false)
+            })
+            .or_else(|| {
+                points.iter().enumerate().position(|(i, pos)| {
+                    node_map
+                        .get(&HashVec2(*pos))
+                        .map(|n| {
+                            let next = points[(i + 1) % points.len()];
+                            let diff = next - *pos;
+
+                            boundary.outdegree(*n) == boundary.indegree(*n)
+                                && dot_fn(
+                                    &boundary,
+                                    diff,
+                                    boundary.edges_directed(*n, Direction::Incoming),
+                                )
+                                .unwrap_or(-2.0)
+                                    < dot_fn(&boundary, -diff, boundary.edges(*n)).unwrap_or(-1.0)
+                        })
+                        .unwrap_or(false)
+                })
+            })
+            .or(if boundary.edge_count() == 0 && ignored {
+                Some(0)
+            } else {
+                None
+            });
+
+        //for (i, point) in points.iter().enumerate() {
+        //    println!("{}: {:?}", i, point);
+        //}
+        // Draw the square around the boundary, but only the parts that are in the intersection.
+        if let Some(index) = index {
+            let mut i = index;
+            let mut inside = true;
+
+            // Basically a do-while loop
+            while {
+                let j = (i + 1) % points.len();
+
+                let new_inside = node_map
+                    .get(&HashVec2(points[j]))
+                    .map(|n| boundary.degree(*n) % 2 != 0)
+                    .unwrap_or(false)
+                    != inside;
+
+                //println!("i: {}, j: {}, inside: {}, new_inside: {}", i, j, inside, new_inside);
+
+                if inside {
+                    let node_i = *node_map
+                        .entry(HashVec2(points[i]))
+                        .or_insert_with(|| boundary.add_node(points[i]));
+                    let node_j = *node_map
+                        .entry(HashVec2(points[j]))
+                        .or_insert_with(|| boundary.add_node(points[j]));
+
+                    boundary.add_edge(node_i, node_j, ());
+                }
+
+                inside = new_inside;
+
+                i = j;
+                i != index
+            } {}
+        }
+    }
+
+    fn intersect_center_unit_square(mut boundary: Graph<Vec2, ()>) -> Vec<[Vec2; 3]> {
+        Self::intersect_center_unit_square_on_graph(&mut boundary);
+
+        todo!()
+    }
+
     /// Gets the intersection of a unit cube
     /// and a manifold mesh potentially with boundary.
     /// It is assumed that the mesh's boundary is entirely
     /// on the surface of the cube and that no triangles
     /// are coplanar with a cube face.
     pub fn intersect_unit_cube(mut self, cube_min: Vec3) -> Self {
-        self.mesh.translate(-cube_min);
+        self.mesh.translate(-cube_min - vec3(0.5, 0.5, 0.5));
+        // Cube center is at origin
+        let boundary = self.boundary_graph();
 
-        // Fill in all 6 squares appropriately
+        let mut triangles = self
+            .mesh
+            .face_iter()
+            .map(|f| {
+                let pos = self.mesh.face_positions(f);
+                [pos.0, pos.1, pos.2]
+            })
+            .collect::<Vec<_>>();
+
+        // Fill in all 6 cube faces appropriately
         for normal in vec![
             Vec3::unit_x(),
             -Vec3::unit_x(),
@@ -621,7 +842,53 @@ impl MaterialMesh {
             -Vec3::unit_y(),
             Vec3::unit_z(),
             -Vec3::unit_z(),
-        ] {}
+        ] {
+            // Transform to unit square with (0.0, 0.0) as center
+            let tangent = Transform::<Point3<f64>>::transform_vector(
+                &Mat3::from_cols(Vec3::unit_y(), Vec3::unit_z(), Vec3::unit_x()),
+                normal,
+            );
+            let square_transform = Mat4::from_cols(
+                tangent.extend(0.0),
+                normal.cross(tangent).extend(0.0),
+                normal.extend(0.0),
+                (normal * 0.5).extend(1.0),
+            );
+            let inv_square_transform = square_transform.invert().unwrap();
+
+            // Get part of boundary on this face
+            let mut sub: Graph<Vec2, ()> = boundary.filter_map(
+                |_, node| {
+                    if node.dot(normal) == 0.5 {
+                        Some(
+                            inv_square_transform
+                                .transform_point(Point3::from_homogeneous(node.extend(1.0)))
+                                .to_vec()
+                                .truncate(),
+                        )
+                    } else {
+                        None
+                    }
+                },
+                |_, e| Some(*e),
+            );
+
+            triangles.extend(
+                Self::intersect_center_unit_square(sub)
+                    .into_iter()
+                    .map(|tri_2d| {
+                        let mut tri_3d = [Vec3::zero(); 3];
+                        for i in 0..3 {
+                            tri_3d[i] = square_transform
+                                .transform_point(Point3::from_homogeneous(
+                                    tri_2d[i].extend(0.0).extend(1.0),
+                                ))
+                                .to_vec();
+                        }
+                        tri_3d
+                    }),
+            );
+        }
 
         self
     }
@@ -658,15 +925,28 @@ mod test {
         mesh: &MaterialMesh,
         vertices: Vec<usize>,
         edges: Vec<(usize, usize)>,
-    ) -> Graph<(VertexID, Vec3), ()> {
+    ) -> Graph<Vec3, ()> {
         let v = mesh.mesh.vertex_iter().collect::<Vec<_>>();
 
         Graph::from_elements(
             vertices
                 .into_iter()
                 .map(|vertex| Element::Node {
-                    weight: (v[vertex], mesh.mesh.vertex_position(v[vertex])),
+                    weight: mesh.mesh.vertex_position(v[vertex]),
                 })
+                .chain(edges.into_iter().map(|(s, t)| Element::Edge {
+                    source: s,
+                    target: t,
+                    weight: (),
+                })),
+        )
+    }
+
+    fn create_graph<N>(vertices: Vec<N>, edges: Vec<(usize, usize)>) -> Graph<N, ()> {
+        Graph::from_elements(
+            vertices
+                .into_iter()
+                .map(|vertex| Element::Node { weight: vertex })
                 .chain(edges.into_iter().map(|(s, t)| Element::Edge {
                     source: s,
                     target: t,
@@ -842,6 +1122,157 @@ mod test {
 
         let graph = mesh.boundary_graph();
         let expected = graph_from_mesh(&mesh, vec![], vec![]);
+        assert!(algo::is_isomorphic_matching(
+            &graph,
+            &expected,
+            |x, y| x == y,
+            |x, y| x == y
+        ));
+    }
+
+    #[test]
+    fn test_combine_equal_vertices_none() {
+        let graph = create_graph(
+            vec![
+                vec2(0.0, 0.0),
+                vec2(0.5, 0.0),
+                vec2(1.0, 0.0),
+                vec2(1.5, 0.0),
+            ],
+            vec![(0, 1), (2, 3), (3, 2)],
+        );
+
+        let expected = graph.clone();
+        let result = MaterialMesh::combine_equal_vertices(&graph);
+
+        assert!(algo::is_isomorphic_matching(
+            &result,
+            &expected,
+            |x, y| x == y,
+            |x, y| x == y
+        ));
+    }
+
+    #[test]
+    fn test_combine_equal_vertices_one() {
+        let graph = create_graph(
+            vec![
+                vec2(0.0, 0.0),
+                vec2(0.5, 0.0),
+                vec2(0.5, 0.0),
+                vec2(1.0, 0.0),
+            ],
+            vec![(0, 1), (1, 2), (2, 3), (3, 2)],
+        );
+
+        let expected = create_graph(
+            vec![vec2(0.0, 0.0), vec2(0.5, 0.0), vec2(1.0, 0.0)],
+            vec![(0, 1), (1, 2), (2, 1)],
+        );
+        let result = MaterialMesh::combine_equal_vertices(&graph);
+
+        assert!(algo::is_isomorphic_matching(
+            &result,
+            &expected,
+            |x, y| x == y,
+            |x, y| x == y
+        ));
+    }
+
+    #[test]
+    fn test_combine_equal_vertices_edge_collapse() {
+        let graph = create_graph(
+            vec![
+                vec2(0.0, 0.0),
+                vec2(0.5, 0.0),
+                vec2(0.5, 0.0),
+                vec2(0.0, 0.0),
+            ],
+            vec![(0, 1), (3, 2)],
+        );
+
+        let expected = create_graph(vec![vec2(0.0, 0.0), vec2(0.5, 0.0)], vec![(0, 1)]);
+        let result = MaterialMesh::combine_equal_vertices(&graph);
+
+        assert!(algo::is_isomorphic_matching(
+            &result,
+            &expected,
+            |x, y| x == y,
+            |x, y| x == y
+        ));
+    }
+
+    #[test]
+    fn test_boundary_square_intersect_edge_across() {
+        let mut graph = create_graph(vec![vec2(-0.5, -0.25), vec2(0.5, -0.25)], vec![(0, 1)]);
+        let expected = create_graph(
+            vec![
+                vec2(-0.5, -0.5),
+                vec2(0.5, -0.5),
+                vec2(-0.5, -0.25),
+                vec2(0.5, -0.25),
+            ],
+            vec![(3, 1), (1, 0), (0, 2), (2, 3)],
+        );
+
+        MaterialMesh::intersect_center_unit_square_on_graph(&mut graph);
+        assert!(algo::is_isomorphic_matching(
+            &graph,
+            &expected,
+            |x, y| x == y,
+            |x, y| x == y
+        ));
+    }
+
+    #[test]
+    fn test_boundary_square_intersect_multiple_edges() {
+        let mut graph = create_graph(
+            vec![
+                vec2(-0.5, -0.25),
+                vec2(-0.25, -0.5),
+                vec2(0.25, -0.5),
+                vec2(0.5, -0.25),
+                vec2(0.5, 0.25),
+                vec2(0.25, 0.5),
+                vec2(-0.25, 0.5),
+                vec2(-0.5, 0.25),
+                vec2(0.0, -0.5),
+                vec2(0.0, 0.5),
+            ],
+            vec![(0, 1), (3, 2), (5, 4), (6, 7), (8, 9)],
+        );
+        let mut expected = create_graph(
+            vec![
+                vec2(-0.5, -0.25),
+                vec2(-0.25, -0.5),
+                vec2(0.25, -0.5),
+                vec2(0.5, -0.25),
+                vec2(0.5, 0.25),
+                vec2(0.25, 0.5),
+                vec2(-0.25, 0.5),
+                vec2(-0.5, 0.25),
+                vec2(0.0, -0.5),
+                vec2(0.0, 0.5),
+                vec2(-0.5, -0.5),
+                vec2(-0.5, 0.5),
+            ],
+            vec![
+                (0, 1),
+                (1, 10),
+                (10, 0),
+                (6, 7),
+                (7, 11),
+                (11, 6),
+                (8, 9),
+                (9, 5),
+                (5, 4),
+                (4, 3),
+                (3, 2),
+                (2, 8),
+            ],
+        );
+
+        MaterialMesh::intersect_center_unit_square_on_graph(&mut graph);
         assert!(algo::is_isomorphic_matching(
             &graph,
             &expected,

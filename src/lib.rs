@@ -5,4 +5,5 @@ extern crate rayon;
 extern crate tri_mesh;
 
 pub mod material_mesh;
+pub mod util;
 pub mod voxels;
