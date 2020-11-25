@@ -102,6 +102,7 @@ impl Polygon {
     pub fn from_boundary(mut boundary: Graph<Vec2, ()>) -> Result<Self, TriangulateError> {
         Self::fix_bad_degrees(&mut boundary)?;
         // Now every vertex is indegree-1 outdegree-1.
+        println!("graph: {:?}", boundary);
 
         Ok(Self { boundary })
     }
@@ -114,14 +115,35 @@ impl Polygon {
         // Plane sweep from left to right
         let mut nodes = boundary.node_indices().collect::<Vec<_>>();
         nodes.sort_by_key(|n| FloatOrd(boundary[*n].x));
+        println!("Nodes: {:?}\n", nodes);
 
-        // For comparing sweeping order of nodes.
-        // Because of ties in x coordinate, it's not enough to compare x coordinates.
-        let index_map = nodes
-            .iter()
-            .enumerate()
-            .map(|(i, n)| (*n, i))
-            .collect::<FnvHashMap<_, _>>();
+        // Because of the edge comparison that happens during a split/start vertex,
+        // we can't let there be a vertical edge in the edge list at that time.
+        // When a vertical edge is introduced, it needs to be continued immediately.
+        let (nodes, index_map) = {
+            let mut sorted = vec![];
+            let mut map = FnvHashMap::default();
+
+            nodes.reverse();
+            while let Some(node) = nodes.pop() {
+                if !map.contains_key(&node) {
+                    map.insert(node, sorted.len());
+                    sorted.push(node);
+
+                    let node_a = boundary.edges_in(node).next().unwrap().source();
+                    let node_b = boundary.edges(node).next().unwrap().target();
+
+                    for other in vec![node_a, node_b] {
+                        if boundary[node].x == boundary[other].x && !map.contains_key(&other) {
+                            // Vertical edge. Add other vertex
+                            nodes.push(other);
+                        }
+                    }
+                }
+            }
+
+            (sorted, map)
+        };
 
         // Edges sorted by y position.
         // Each edge also contains the vertex with an x position
@@ -140,6 +162,10 @@ impl Polygon {
 
             if index_a > i && index_b > i {
                 // Split/start vertex
+                println!("Split/start!");
+                println!("{}: {:?}", i, node);
+                println!("edges: {:?}", edges);
+                println!("before swap: a: {:?}, b: {:?}", node_a, node_b);
                 if ((boundary[node_a] - pos).dot(boundary[node_b] - pos) < 0.0
                     && boundary[node_a].y > boundary[node_b].y)
                     || (boundary[node_a] - pos).perp_dot(boundary[node_b] - pos) < 0.0
@@ -157,6 +183,9 @@ impl Polygon {
                         FloatOrd(l_pos.y + (r_pos.y - l_pos.y) * t)
                     })
                 {
+                    println!("after swap: a: {:?}, b: {:?}", node_a, node_b);
+                    println!("index: {}", index);
+                    println!();
                     // Add node as helper in the case of a start vertex
                     // to handle an edge case dealing with a split vertex
                     let helper = if index % 2 == 0 { Some(node) } else { None };
@@ -182,6 +211,10 @@ impl Polygon {
                 }
             } else if index_a < i && index_b < i {
                 // Merge/end vertex
+                println!("Merge/end!");
+                println!("{}: {:?}", i, node);
+                println!("edges: {:?}", edges);
+                println!("before swap: a: {:?}, b: {:?}", node_a, node_b);
                 if ((boundary[node_a] - pos).dot(boundary[node_b] - pos) < 0.0
                     && boundary[node_a].y > boundary[node_b].y)
                     || (boundary[node_a] - pos).perp_dot(boundary[node_b] - pos) > 0.0
@@ -193,6 +226,9 @@ impl Polygon {
                     .iter()
                     .position(|(s, t, _)| (*s, *t) == (node_a, node))
                     .unwrap();
+                println!("after swap: a: {:?}, b: {:?}", node_a, node_b);
+                println!("index: {}", index);
+                println!();
 
                 if index % 2 != 0 {
                     // Merge vertex
@@ -225,6 +261,10 @@ impl Polygon {
                 edges.remove(index);
             } else {
                 // Vertex crosses sweep line
+                println!("Continuation!");
+                println!("{}: {:?}", i, node);
+                println!("edges: {:?}", edges);
+                println!("before swap: a: {:?}, b: {:?}", node_a, node_b);
                 if index_a > i {
                     std::mem::swap(&mut node_a, &mut node_b);
                 }
@@ -233,6 +273,9 @@ impl Polygon {
                     .iter()
                     .position(|(s, t, _)| (*s, *t) == (node_a, node))
                     .unwrap();
+                println!("after swap: a: {:?}, b: {:?}", node_a, node_b);
+                println!("index: {}", index);
+                println!();
 
                 if let Some(helper) = edges[index].2 {
                     if helper != node_a {
@@ -392,6 +435,41 @@ mod test {
     }
 
     #[test]
+    fn test_fix_bad_degrees_split_quad() {
+        // multiple vertices need to be split
+        let mut graph = create_graph(
+            vec![
+                vec2(0.0, 1.0),
+                vec2(1.0, 0.0),
+                vec2(2.0, 1.0),
+                vec2(1.0, 2.0),
+            ],
+            vec![(0, 1), (1, 2), (2, 3), (3, 0), (1, 3), (3, 1)],
+        );
+        let expected = create_graph(
+            vec![
+                vec2(0.0, 1.0),
+                vec2(1.0, 0.0),
+                vec2(2.0, 1.0),
+                vec2(1.0, 2.0),
+                vec2(1.0, 0.0),
+                vec2(1.0, 2.0),
+            ],
+            vec![(0, 1), (1, 3), (3, 0), (2, 5), (5, 4), (4, 2)],
+        );
+
+        let result = Polygon::fix_bad_degrees(&mut graph);
+        assert_eq!(result, Ok(()));
+        assert!(algo::is_isomorphic_matching(
+            &graph,
+            &expected,
+            |x, y| x == y,
+            |x, y| x == y
+        ));
+    }
+
+
+    #[test]
     fn test_monotone_decomposition_triangle() {
         let mut polygon = Polygon::from_boundary(create_graph(
             vec![vec2(0.0, 0.0), vec2(1.0, 0.0), vec2(1.0, 1.0)],
@@ -418,7 +496,77 @@ mod test {
                 vec2(2.0, 1.0),
                 vec2(1.0, 2.0),
             ],
+            vec![(0, 1), (1, 2), (2, 3), (3, 0)],
+        ))
+        .unwrap();
+        let expected = create_graph(
+            vec![
+                vec2(0.0, 1.0),
+                vec2(1.0, 0.0),
+                vec2(2.0, 1.0),
+                vec2(1.0, 2.0),
+            ],
             vec![(0, 1), (1, 2), (2, 3), (3, 0), (1, 3), (3, 1)],
+        );
+
+        polygon.monotone_decompose();
+        assert!(algo::is_isomorphic_matching(
+            &polygon.boundary,
+            &expected,
+            |x, y| x == y,
+            |x, y| x == y
+        ));
+    }
+
+    #[test]
+    fn test_monotone_decomposition_regression_quad() {
+        // Each step (fix bad vertices, monotone decomposition) seems fine in isolation
+        // but the combination glitches?
+        // Turns out, order of vertical edges matters
+        let mut polygon = Polygon::from_boundary(create_graph(
+            vec![
+                vec2(0.0, 1.0),
+                vec2(1.0, 0.0),
+                vec2(2.0, 1.0),
+                vec2(1.0, 2.0),
+            ],
+            vec![(0, 1), (1, 2), (2, 3), (3, 0), (1, 3), (3, 1)],
+        ))
+        .unwrap();
+        let expected = create_graph(
+            vec![
+                vec2(0.0, 1.0),
+                vec2(1.0, 0.0),
+                vec2(2.0, 1.0),
+                vec2(1.0, 2.0),
+                vec2(1.0, 0.0),
+                vec2(1.0, 2.0),
+            ],
+            vec![(0, 1), (1, 3), (3, 0), (2, 5), (5, 4), (4, 2)],
+        );
+
+        polygon.monotone_decompose();
+        assert!(algo::is_isomorphic_matching(
+            &polygon.boundary,
+            &expected,
+            |x, y| x == y,
+            |x, y| x == y
+        ));
+    }
+
+    #[test]
+    fn test_monotone_decomposition_split_quad() {
+        // vertices in the same position (but belong to different triangles)
+        let mut polygon = Polygon::from_boundary(create_graph(
+            vec![
+                vec2(0.0, 1.0),
+                vec2(1.0, 0.0),
+                vec2(2.0, 1.0),
+                vec2(1.0, 2.0),
+                vec2(1.0, 0.0),
+                vec2(1.0, 2.0),
+            ],
+            vec![(0, 1), (1, 3), (3, 0), (2, 5), (5, 4), (4, 2)],
         ))
         .unwrap();
         let expected = polygon.boundary.clone();
@@ -546,6 +694,41 @@ mod test {
                 (4, 3),
                 (1, 6),
                 (6, 1),
+            ],
+        );
+
+        polygon.monotone_decompose();
+        assert!(algo::is_isomorphic_matching(
+            &polygon.boundary,
+            &expected,
+            |x, y| x == y,
+            |x, y| x == y
+        ));
+    }
+
+    #[test]
+    fn test_monotone_decomposition_complex() {
+        // contains a merge vertex that needs to be connected to a split vertex.
+        // also a counterexample showing that comparing y coordinates of
+        // edge endpoints is not enough to determine which edge comes first.
+        let mut polygon = Polygon::from_boundary(create_graph(
+            vec![
+                vec2(3.0, 0.0), vec2(7.0, 0.0), vec2(9.0, 5.0), vec2(6.0, 2.0), vec2(7.0, 4.0),
+                vec2(4.0, 4.0), vec2(2.0, 2.0), vec2(5.0, 3.0), vec2(4.0, 1.0), vec2(0.0, 2.0),
+            ],
+            vec![
+                (0, 1), (1, 2), (2, 3), (3, 4), (4, 5), (5, 6), (6, 7), (7, 8), (8, 9), (9, 0),
+            ],
+        ))
+        .unwrap();
+        let expected = create_graph(
+            vec![
+                vec2(3.0, 0.0), vec2(7.0, 0.0), vec2(9.0, 5.0), vec2(6.0, 2.0), vec2(7.0, 4.0),
+                vec2(4.0, 4.0), vec2(2.0, 2.0), vec2(5.0, 3.0), vec2(4.0, 1.0), vec2(0.0, 2.0),
+            ],
+            vec![
+                (0, 1), (1, 2), (2, 3), (3, 4), (4, 5), (5, 6), (6, 7), (7, 8), (8, 9), (9, 0),
+                (0, 8), (8, 0), (1, 3), (3, 1), (3, 7), (7, 3), (5, 7), (7, 5)
             ],
         );
 
