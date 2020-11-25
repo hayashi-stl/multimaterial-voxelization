@@ -8,7 +8,7 @@ use std::path::Path;
 use tri_mesh::mesh_builder;
 use tri_mesh::prelude::*;
 
-use crate::util::{Degree, HashVec2, Vec2};
+use crate::util::{GraphEx, HashVec2, Vec2};
 
 /// The ID type for a material
 /// 0 is reserved for the absence of a material
@@ -605,9 +605,7 @@ impl MaterialMesh {
             }
         }
 
-        graph.retain_nodes(|graph, n| {
-            graph.degree(n) > 0
-        });
+        graph.retain_nodes(|graph, n| graph.degree(n) > 0);
 
         graph
     }
@@ -658,8 +656,8 @@ impl MaterialMesh {
             let pos1 = sub[v1];
 
             // Edge is on boundary of face if at least 1 coordinate is ±0.5 and the same
-            if ((pos0[0].abs() == 0.5 && pos0[0] == pos1[0])
-                || (pos0[1].abs() == 0.5 && pos0[1] == pos1[1]))
+            if ((pos0.x.abs() == 0.5 && pos0.x == pos1.x)
+                || (pos0.y.abs() == 0.5 && pos0.y == pos1.y))
                 && pos0.perp_dot(pos1) > 0.0
             {
                 ignored_ccw = true;
@@ -682,8 +680,8 @@ impl MaterialMesh {
             let pos1 = sub[v1];
 
             // Edge is on boundary of face if at least 1 coordinate is ±0.5 and the same
-            if (pos0[0].abs() == 0.5 && pos0[0] == pos1[0])
-                || (pos0[1].abs() == 0.5 && pos0[1] == pos1[1])
+            if (pos0.x.abs() == 0.5 && pos0.x == pos1.x)
+                || (pos0.y.abs() == 0.5 && pos0.y == pos1.y)
             {
                 ignored_cw = true;
                 false
@@ -714,20 +712,20 @@ impl MaterialMesh {
         .chain(
             boundary
                 .node_weights_mut()
-                .filter(|pos| pos[0].abs() == 0.5 || pos[1].abs() == 0.5)
+                .filter(|pos| pos.x.abs() == 0.5 || pos.y.abs() == 0.5)
                 .map(|pos| *pos),
         )
         .collect::<Vec<_>>();
 
         points.sort_by_key(|pos| {
-            FloatOrd(if pos[0] == -0.5 {
-                0.5 + pos[1]
-            } else if pos[1] == 0.5 {
-                1.5 + pos[0]
-            } else if pos[0] == 0.5 {
-                2.5 - pos[1]
-            } else if pos[1] == -0.5 {
-                3.5 - pos[0]
+            FloatOrd(if pos.x == -0.5 {
+                0.5 + pos.y
+            } else if pos.y == 0.5 {
+                1.5 + pos.x
+            } else if pos.x == 0.5 {
+                2.5 - pos.y
+            } else if pos.y == -0.5 {
+                3.5 - pos.x
             } else {
                 unreachable!()
             })
@@ -737,7 +735,13 @@ impl MaterialMesh {
         // Finds the minimum dot product between the given vec and given edges
         let dot_fn = |graph: &Graph<Vec2, ()>, vec: Vec2, edges: Edges<(), Directed>| {
             edges
-                .map(|edge| FloatOrd((graph[edge.target()] - graph[edge.source()]).normalize().dot(vec)))
+                .map(|edge| {
+                    FloatOrd(
+                        (graph[edge.target()] - graph[edge.source()])
+                            .normalize()
+                            .dot(vec),
+                    )
+                })
                 .min()
                 .map(|f| f.0)
         };
@@ -778,11 +782,13 @@ impl MaterialMesh {
                         .unwrap_or(false)
                 })
             })
-            .or(if boundary.edge_count() == 0 && ignored_cw && !ignored_ccw {
-                Some(0)
-            } else {
-                None
-            });
+            .or(
+                if boundary.edge_count() == 0 && ignored_cw && !ignored_ccw {
+                    Some(0)
+                } else {
+                    None
+                },
+            );
 
         //for (i, point) in points.iter().enumerate() {
         //    println!("{}: {:?}", i, point);
@@ -824,23 +830,30 @@ impl MaterialMesh {
         } else if boundary.edge_count() > 0 {
             // At least there are hole(s). Use them to determine whether a square should be drawn.
             // First, look for an outer hole.
-            
+
             // TODO: Handle holes with slits
 
             // Obtain bottommost vertex. In case of tie, get rightmost vertex
-            let node = boundary.node_indices()
+            let node = boundary
+                .node_indices()
                 .min_by_key(|n| {
                     let pos = boundary[*n];
-                    (FloatOrd(pos[1]), FloatOrd(-pos[0]))
-                }).expect("There should be a node here");
-            
+                    (FloatOrd(pos.y), FloatOrd(-pos.x))
+                })
+                .expect("There should be a node here");
+
             // The vertex is guaranteed to be convex and at an outer hole.
             // Determine which way it goes.
-            let square = dot_fn(&boundary, -Vec2::unit_x(), boundary.edges(node)) <
-                dot_fn(&boundary, Vec2::unit_x(), boundary.edges_directed(node, Direction::Incoming));
+            let square = dot_fn(&boundary, -Vec2::unit_x(), boundary.edges(node))
+                < dot_fn(
+                    &boundary,
+                    Vec2::unit_x(),
+                    boundary.edges_directed(node, Direction::Incoming),
+                );
 
             if square {
-                let mut indexes = points.into_iter()
+                let mut indexes = points
+                    .into_iter()
                     .map(|pos| boundary.add_node(pos))
                     .collect::<Vec<_>>();
                 indexes.push(indexes[0]);
@@ -858,19 +871,27 @@ impl MaterialMesh {
     fn intersect_center_unit_square_with_context(&self, boundary: &mut Graph<Vec2, ()>) {
         // Find the volume under the mesh to determine
         // whether the square is outside or inside.
-        let volume = self.mesh.face_iter()
+        let volume = self
+            .mesh
+            .face_iter()
             .map(|f| {
                 let center = self.mesh.face_center(f);
                 let pos = self.mesh.face_positions(f);
                 // Technically need to divide by 2, but it doesn't matter
-                (center[2] - 1.0) * (pos.1 - pos.0).cross(pos.2 - pos.0).dot(Vec3::unit_z())
+                (center.z - 1.0) * (pos.1 - pos.0).cross(pos.2 - pos.0).dot(Vec3::unit_z())
             })
             .sum::<f64>();
-            
+
         if volume < 0.0 {
-            let mut indexes = vec![vec2(-0.5, -0.5), vec2(-0.5, 0.5), vec2(0.5, 0.5), vec2(0.5, -0.5)].into_iter()
-                .map(|pos| boundary.add_node(pos))
-                .collect::<Vec<_>>();
+            let mut indexes = vec![
+                vec2(-0.5, -0.5),
+                vec2(-0.5, 0.5),
+                vec2(0.5, 0.5),
+                vec2(0.5, -0.5),
+            ]
+            .into_iter()
+            .map(|pos| boundary.add_node(pos))
+            .collect::<Vec<_>>();
             indexes.push(indexes[0]);
 
             for ii in indexes.windows(2) {
@@ -879,7 +900,10 @@ impl MaterialMesh {
         }
     }
 
-    fn intersect_center_unit_square(mesh_fn: impl FnOnce() -> Self, mut boundary: Graph<Vec2, ()>) -> Vec<[Vec2; 3]> {
+    fn intersect_center_unit_square(
+        mesh_fn: impl FnOnce() -> Self,
+        mut boundary: Graph<Vec2, ()>,
+    ) -> Vec<[Vec2; 3]> {
         if !Self::intersect_center_unit_square_on_graph(&mut boundary) {
             mesh_fn().intersect_center_unit_square_with_context(&mut boundary);
         }
@@ -948,20 +972,20 @@ impl MaterialMesh {
             triangles.extend(
                 Self::intersect_center_unit_square(
                     || MaterialMesh::new(self.mesh.transformed(inv_square_transform)),
-                    sub
+                    sub,
                 )
-                    .into_iter()
-                    .map(|tri_2d| {
-                        let mut tri_3d = [Vec3::zero(); 3];
-                        for i in 0..3 {
-                            tri_3d[i] = square_transform
-                                .transform_point(Point3::from_homogeneous(
-                                    tri_2d[i].extend(0.0).extend(1.0),
-                                ))
-                                .to_vec();
-                        }
-                        tri_3d
-                    }),
+                .into_iter()
+                .map(|tri_2d| {
+                    let mut tri_3d = [Vec3::zero(); 3];
+                    for i in 0..3 {
+                        tri_3d[i] = square_transform
+                            .transform_point(Point3::from_homogeneous(
+                                tri_2d[i].extend(0.0).extend(1.0),
+                            ))
+                            .to_vec();
+                    }
+                    tri_3d
+                }),
             );
         }
 
@@ -1359,16 +1383,9 @@ mod test {
     #[test]
     fn test_boundary_square_intersect_corner() {
         // Boundary hits a corner.
-        let mut graph = create_graph(
-            vec![
-                vec2(-0.5, -0.5), vec2(0.5, 0.5)
-            ],
-            vec![(0, 1)],
-        );
+        let mut graph = create_graph(vec![vec2(-0.5, -0.5), vec2(0.5, 0.5)], vec![(0, 1)]);
         let expected = create_graph(
-            vec![
-                vec2(-0.5, -0.5), vec2(0.5, 0.5), vec2(0.5, -0.5)
-            ],
+            vec![vec2(-0.5, -0.5), vec2(0.5, 0.5), vec2(0.5, -0.5)],
             vec![(0, 1), (1, 2), (2, 0)],
         );
 
@@ -1386,7 +1403,10 @@ mod test {
         // Boundary has a degree-2 vertex on square boundary. No outer square.
         let mut graph = create_graph(
             vec![
-                vec2(-0.5, 0.0), vec2(0.0, -0.5), vec2(0.5, 0.0), vec2(0.0, 0.5)
+                vec2(-0.5, 0.0),
+                vec2(0.0, -0.5),
+                vec2(0.5, 0.0),
+                vec2(0.0, 0.5),
             ],
             vec![(0, 3), (3, 2), (2, 1), (1, 0)],
         );
@@ -1406,16 +1426,38 @@ mod test {
         // Boundary has a degree-2 vertex on square boundary. Yes outer square.
         let mut graph = create_graph(
             vec![
-                vec2(-0.5, 0.0), vec2(0.0, -0.5), vec2(0.5, 0.0), vec2(0.0, 0.5)
+                vec2(-0.5, 0.0),
+                vec2(0.0, -0.5),
+                vec2(0.5, 0.0),
+                vec2(0.0, 0.5),
             ],
             vec![(0, 1), (1, 2), (2, 3), (3, 0)],
         );
         let expected = create_graph(
             vec![
-                vec2(-0.5, 0.0), vec2(0.0, -0.5), vec2(0.5, 0.0), vec2(0.0, 0.5),
-                vec2(-0.5, -0.5), vec2(0.5, -0.5), vec2(0.5, 0.5), vec2(-0.5, 0.5),
+                vec2(-0.5, 0.0),
+                vec2(0.0, -0.5),
+                vec2(0.5, 0.0),
+                vec2(0.0, 0.5),
+                vec2(-0.5, -0.5),
+                vec2(0.5, -0.5),
+                vec2(0.5, 0.5),
+                vec2(-0.5, 0.5),
             ],
-            vec![(0, 1), (1, 4), (4, 0), (1, 2), (2, 5), (5, 1), (2, 3), (3, 6), (6, 2), (3, 0), (0, 7), (7, 3)],
+            vec![
+                (0, 1),
+                (1, 4),
+                (4, 0),
+                (1, 2),
+                (2, 5),
+                (5, 1),
+                (2, 3),
+                (3, 6),
+                (6, 2),
+                (3, 0),
+                (0, 7),
+                (7, 3),
+            ],
         );
 
         MaterialMesh::intersect_center_unit_square_on_graph(&mut graph);
@@ -1432,13 +1474,20 @@ mod test {
         // Boundary has a degree-3 vertex on square boundary.
         let mut graph = create_graph(
             vec![
-                vec2(-0.5, 0.0), vec2(0.5, -0.5), vec2(0.5, 0.0), vec2(0.5, 0.5)
+                vec2(-0.5, 0.0),
+                vec2(0.5, -0.5),
+                vec2(0.5, 0.0),
+                vec2(0.5, 0.5),
             ],
             vec![(0, 1), (2, 0), (0, 3)],
         );
         let expected = create_graph(
             vec![
-                vec2(-0.5, 0.0), vec2(0.5, -0.5), vec2(0.5, 0.0), vec2(0.5, 0.5), vec2(-0.5, -0.5)
+                vec2(-0.5, 0.0),
+                vec2(0.5, -0.5),
+                vec2(0.5, 0.0),
+                vec2(0.5, 0.5),
+                vec2(-0.5, -0.5),
             ],
             vec![(0, 1), (1, 4), (4, 0), (0, 3), (3, 2), (2, 0)],
         );
@@ -1456,14 +1505,16 @@ mod test {
     fn test_boundary_square_intersect_boundary_clockwise() {
         // Boundary is only on square boundary. Edges go clockwise.
         let mut graph = create_graph(
-            vec![
-                vec2(-0.5, 0.5), vec2(0.0, 0.5), vec2(0.5, 0.5)
-            ],
+            vec![vec2(-0.5, 0.5), vec2(0.0, 0.5), vec2(0.5, 0.5)],
             vec![(0, 1), (1, 2)],
         );
         let expected = create_graph(
             vec![
-                vec2(-0.5, 0.5), vec2(0.0, 0.5), vec2(0.5, 0.5), vec2(0.5, -0.5), vec2(-0.5, -0.5)
+                vec2(-0.5, 0.5),
+                vec2(0.0, 0.5),
+                vec2(0.5, 0.5),
+                vec2(0.5, -0.5),
+                vec2(-0.5, -0.5),
             ],
             vec![(0, 1), (1, 2), (2, 3), (3, 4), (4, 0)],
         );
@@ -1481,15 +1532,10 @@ mod test {
     fn test_boundary_square_intersect_boundary_counterclockwise() {
         // Boundary is only on square boundary. Edges go counterclockwise.
         let mut graph = create_graph(
-            vec![
-                vec2(-0.5, 0.5), vec2(0.0, 0.5), vec2(0.5, 0.5)
-            ],
+            vec![vec2(-0.5, 0.5), vec2(0.0, 0.5), vec2(0.5, 0.5)],
             vec![(2, 1), (1, 0)],
         );
-        let expected = create_graph(
-            vec![],
-            vec![],
-        );
+        let expected = create_graph(vec![], vec![]);
 
         MaterialMesh::intersect_center_unit_square_on_graph(&mut graph);
         assert!(algo::is_isomorphic_matching(
@@ -1504,9 +1550,7 @@ mod test {
     fn test_boundary_square_intersect_hole_clockwise() {
         // Boundary is completely inside square. Hole goes clockwise.
         let mut graph = create_graph(
-            vec![
-                vec2(-0.25, -0.25), vec2(-0.25, 0.25), vec2(0.25, 0.25)
-            ],
+            vec![vec2(-0.25, -0.25), vec2(-0.25, 0.25), vec2(0.25, 0.25)],
             vec![(0, 1), (1, 2), (2, 0)],
         );
         let expected = graph.clone();
@@ -1524,15 +1568,18 @@ mod test {
     fn test_boundary_square_intersect_hole_counterclockwise() {
         // Boundary is completely inside square. Hole goes counterclockwise.
         let mut graph = create_graph(
-            vec![
-                vec2(-0.25, -0.25), vec2(-0.25, 0.25), vec2(0.25, 0.25)
-            ],
+            vec![vec2(-0.25, -0.25), vec2(-0.25, 0.25), vec2(0.25, 0.25)],
             vec![(0, 2), (2, 1), (1, 0)],
         );
         let expected = create_graph(
             vec![
-                vec2(-0.25, -0.25), vec2(-0.25, 0.25), vec2(0.25, 0.25),
-                vec2(-0.5, -0.5), vec2(0.5, -0.5), vec2(0.5, 0.5), vec2(-0.5, 0.5),
+                vec2(-0.25, -0.25),
+                vec2(-0.25, 0.25),
+                vec2(0.25, 0.25),
+                vec2(-0.5, -0.5),
+                vec2(0.5, -0.5),
+                vec2(0.5, 0.5),
+                vec2(-0.5, 0.5),
             ],
             vec![(0, 2), (2, 1), (1, 0), (3, 6), (6, 5), (5, 4), (4, 3)],
         );
@@ -1548,13 +1595,12 @@ mod test {
 
     #[test]
     fn test_boundary_square_intersect_nothing() {
-        let mut graph = create_graph(
-            vec![],
-            vec![],
-        );
+        let mut graph = create_graph(vec![], vec![]);
         let expected = graph.clone();
 
-        assert!(!MaterialMesh::intersect_center_unit_square_on_graph(&mut graph));
+        assert!(!MaterialMesh::intersect_center_unit_square_on_graph(
+            &mut graph
+        ));
         assert!(algo::is_isomorphic_matching(
             &graph,
             &expected,
@@ -1566,8 +1612,10 @@ mod test {
     #[test]
     fn test_boundary_square_context_tet_outside() {
         let mesh = create_mesh(
-            vec![-0.25, -0.25, -0.75, 0.25, 0.25, -0.75, 0.25, -0.25, -0.25, -0.25, 0.25, -0.25],
-            vec![0, 1, 2, 2, 3, 0, 1, 0, 3, 3, 2, 1]
+            vec![
+                -0.25, -0.25, -0.75, 0.25, 0.25, -0.75, 0.25, -0.25, -0.25, -0.25, 0.25, -0.25,
+            ],
+            vec![0, 1, 2, 2, 3, 0, 1, 0, 3, 3, 2, 1],
         );
         let mut graph = Graph::new();
         let expected = graph.clone();
@@ -1584,13 +1632,18 @@ mod test {
     #[test]
     fn test_boundary_square_context_tet_inside() {
         let mesh = create_mesh(
-            vec![-0.25, -0.25, -0.75, 0.25, 0.25, -0.75, 0.25, -0.25, -0.25, -0.25, 0.25, -0.25],
-            vec![0, 2, 1, 2, 0, 3, 1, 3, 0, 3, 1, 2]
+            vec![
+                -0.25, -0.25, -0.75, 0.25, 0.25, -0.75, 0.25, -0.25, -0.25, -0.25, 0.25, -0.25,
+            ],
+            vec![0, 2, 1, 2, 0, 3, 1, 3, 0, 3, 1, 2],
         );
         let mut graph = Graph::new();
         let expected = create_graph(
             vec![
-                vec2(-0.5, -0.5), vec2(0.5, -0.5), vec2(0.5, 0.5), vec2(-0.5, 0.5),
+                vec2(-0.5, -0.5),
+                vec2(0.5, -0.5),
+                vec2(0.5, 0.5),
+                vec2(-0.5, 0.5),
             ],
             vec![(0, 3), (3, 2), (2, 1), (1, 0)],
         );

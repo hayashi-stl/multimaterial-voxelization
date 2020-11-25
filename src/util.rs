@@ -1,6 +1,8 @@
 use float_ord::FloatOrd;
 use num_traits::Float;
+use petgraph::graph::Edges;
 use petgraph::prelude::*;
+use petgraph::EdgeType;
 use std::hash::{Hash, Hasher};
 use tri_mesh::prelude::*;
 
@@ -12,7 +14,7 @@ pub struct HashVec2(pub Vec2);
 
 impl HashVec2 {
     fn float_ord(self) -> (FloatOrd<f64>, FloatOrd<f64>) {
-        (FloatOrd(self.0[0]), FloatOrd(self.0[1]))
+        (FloatOrd(self.0.x), FloatOrd(self.0.y))
     }
 }
 
@@ -30,8 +32,10 @@ impl Hash for HashVec2 {
     }
 }
 
-/// Something with an indegree and outdegree measure
-pub trait Degree {
+pub trait GraphEx {
+    type Edge;
+    type Type: EdgeType;
+
     fn indegree(&self, node: NodeIndex) -> usize;
 
     fn outdegree(&self, node: NodeIndex) -> usize;
@@ -40,14 +44,24 @@ pub trait Degree {
     fn degree(&self, node: NodeIndex) -> usize {
         self.indegree(node) + self.outdegree(node)
     }
+
+    /// Convenience method to get incoming edges.
+    fn edges_in(&self, node: NodeIndex) -> Edges<Self::Edge, Self::Type>;
 }
 
-impl<N, E> Degree for Graph<N, E> {
+impl<N, E> GraphEx for Graph<N, E> {
+    type Edge = E;
+    type Type = Directed;
+
     fn indegree(&self, node: NodeIndex) -> usize {
-        self.edges_directed(node, Direction::Incoming).count()
+        self.edges_in(node).count()
     }
 
     fn outdegree(&self, node: NodeIndex) -> usize {
         self.edges(node).count()
+    }
+
+    fn edges_in(&self, node: NodeIndex) -> Edges<Self::Edge, Self::Type> {
+        self.edges_directed(node, Direction::Incoming)
     }
 }
