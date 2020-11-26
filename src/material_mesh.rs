@@ -8,6 +8,7 @@ use std::path::Path;
 use tri_mesh::mesh_builder;
 use tri_mesh::prelude::*;
 
+use crate::triangulate::Polygon;
 use crate::util::{GraphEx, HashVec2, Vec2};
 
 /// The ID type for a material
@@ -908,7 +909,9 @@ impl MaterialMesh {
             mesh_fn().intersect_center_unit_square_with_context(&mut boundary);
         }
 
-        todo!()
+        Polygon::from_boundary(boundary)
+            .expect("Bad complex voxel boundary")
+            .triangulate()
     }
 
     /// Gets the intersection of a unit cube

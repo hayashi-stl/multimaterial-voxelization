@@ -183,15 +183,11 @@ impl Polygon {
         Ok(Self { boundary })
     }
 
-    fn monotone_cycles(sweep: FnvHashMap<NodeIndex, SweepVertex>) -> Vec<Vec<NodeIndex>> {
+    fn monotone_cycles(sweep: FnvHashMap<NodeIndex, SweepVertex>) -> Vec<VecDeque<NodeIndex>> {
         let mut target_map = sweep
             .into_iter()
             .map(|(k, v)| (k, v.sources_targets()))
             .collect::<FnvHashMap<_, _>>();
-
-        target_map
-            .iter()
-            .for_each(|(k, v)| println!("node: {:?}, targets: {:?}", k, v));
 
         let mut cycles = vec![];
 
@@ -199,10 +195,10 @@ impl Polygon {
         while let Some(start) = target_map.keys().next().copied() {
             let mut node = start;
             let mut prev = node;
-            let mut cycle = vec![];
+            let mut cycle = VecDeque::new();
 
             while {
-                cycle.push(node);
+                cycle.push_back(node);
                 let targets = target_map.get_mut(&node).unwrap();
 
                 let new_node = if prev == node {
@@ -236,13 +232,12 @@ impl Polygon {
     /// Returns a list of monotone mountains, where
     /// each item contains the vertices of the monotone mountain
     /// in circular order.
-    fn monotone_decompose(&mut self) -> Vec<Vec<NodeIndex>> {
+    fn monotone_decompose(&mut self) -> Vec<VecDeque<NodeIndex>> {
         let boundary = &mut self.boundary;
 
         // Plane sweep from left to right
         let mut nodes = boundary.node_indices().collect::<Vec<_>>();
         nodes.sort_by_key(|n| FloatOrd(boundary[*n].x));
-        println!("Nodes: {:?}\n", nodes);
 
         // Because of the edge comparison that happens during a split/start vertex,
         // we can't let there be a vertical edge in the edge list at that time.
@@ -439,6 +434,83 @@ impl Polygon {
 
         Self::monotone_cycles(sweep_nodes)
     }
+
+    /// Triangulates a bunch of x-monotone mountains
+    fn triangulate_monotone_cycles(
+        &mut self,
+        monotones: Vec<VecDeque<NodeIndex>>,
+    ) -> Vec<[NodeIndex; 3]> {
+        let boundary = &mut self.boundary;
+        let mut triangles = vec![];
+
+        for mut cycle in monotones {
+            // Rotate cycle so that the end points of the long line segment are on opposite ends
+            let index = cycle
+                .iter()
+                .zip(cycle.iter().cycle().skip(1))
+                .enumerate()
+                .max_by_key(|(i, (s, t))| FloatOrd((boundary[**t].x - boundary[**s].x).abs()))
+                .unwrap()
+                .0;
+            cycle.rotate_left(index + 1);
+
+            // Whether the chain goes from right to left instead of left to right
+            let flipped = boundary[cycle[cycle.len() - 1]].x < boundary[cycle[0]].x;
+
+            // Whether an angle at boundary[i] is convex
+            let convex_fn = |boundary: &Graph<Vec2, ()>, cycle: &VecDeque<NodeIndex>, i: usize| {
+                let a = boundary[cycle[i - 1]];
+                let b = boundary[cycle[i]];
+                let c = boundary[cycle[i + 1]];
+                if (b - a).dot(c - b) < 0.0 {
+                    flipped == (c.y < b.y)
+                } else {
+                    (b - a).perp_dot(c - b) >= 0.0
+                }
+            };
+
+            let mut convex_arr = (1..cycle.len() - 1)
+                .map(|i| convex_fn(&boundary, &cycle, i))
+                .collect::<Vec<_>>();
+
+            // Chop away triangles!
+            while cycle.len() > 2 {
+                let index = convex_arr
+                    .iter()
+                    .rposition(|b| *b)
+                    .unwrap_or(cycle.len() - 3)
+                    + 1;
+
+                triangles.push([cycle[index - 1], cycle[index], cycle[index + 1]]);
+                // A cycle length of 3 makes the long segment part of the triangle. Don't double that segment.
+                if cycle.len() > 3 {
+                    boundary.add_edge(cycle[index - 1], cycle[index + 1], ());
+                    boundary.add_edge(cycle[index + 1], cycle[index - 1], ());
+                }
+                cycle.remove(index);
+                convex_arr.remove(index - 1);
+
+                if index > 1 {
+                    convex_arr[index - 2] = convex_fn(&boundary, &cycle, index - 1);
+                }
+                if index < cycle.len() - 1 {
+                    convex_arr[index - 1] = convex_fn(&boundary, &cycle, index);
+                }
+            }
+        }
+
+        triangles
+    }
+
+    pub fn triangulate(mut self) -> Vec<[Vec2; 3]> {
+        let monotones = self.monotone_decompose();
+        let cycles = self.triangulate_monotone_cycles(monotones);
+
+        cycles
+            .into_iter()
+            .map(|[a, b, c]| [self.boundary[a], self.boundary[b], self.boundary[c]])
+            .collect()
+    }
 }
 
 #[cfg(test)]
@@ -471,10 +543,21 @@ mod test {
             .collect()
     }
 
-    fn testable_decomposition(cycles: Vec<Vec<NodeIndex>>) -> FnvHashSet<Ring<NodeIndex>> {
+    fn testable_decomposition(cycles: Vec<VecDeque<NodeIndex>>) -> FnvHashSet<Ring<NodeIndex>> {
+        cycles.into_iter().map(|v| Ring(v)).collect()
+    }
+
+    fn create_triangulation(cycles: Vec<[usize; 3]>) -> FnvHashSet<Ring<NodeIndex>> {
         cycles
             .into_iter()
-            .map(|v| Ring(v.into_iter().collect()))
+            .map(|[a, b, c]| Ring(vec![a, b, c].into_iter().map(NodeIndex::new).collect()))
+            .collect()
+    }
+
+    fn testable_triangulation(cycles: Vec<[NodeIndex; 3]>) -> FnvHashSet<Ring<NodeIndex>> {
+        cycles
+            .into_iter()
+            .map(|[a, b, c]| Ring(vec![a, b, c].into_iter().collect()))
             .collect()
     }
 
@@ -673,14 +756,16 @@ mod test {
         ))
         .unwrap();
         let expected = polygon.boundary.clone();
+        let expected_cycles = create_decomposition(vec![vec![0, 1, 2]]);
 
-        polygon.monotone_decompose();
+        let cycles = testable_decomposition(polygon.monotone_decompose());
         assert!(algo::is_isomorphic_matching(
             &polygon.boundary,
             &expected,
             |x, y| x == y,
             |x, y| x == y
         ));
+        assert_eq!(cycles, expected_cycles);
     }
 
     #[test]
@@ -768,14 +853,16 @@ mod test {
         ))
         .unwrap();
         let expected = polygon.boundary.clone();
+        let expected_cycles = create_decomposition(vec![vec![0, 1, 3], vec![2, 5, 4]]);
 
-        polygon.monotone_decompose();
+        let cycles = testable_decomposition(polygon.monotone_decompose());
         assert!(algo::is_isomorphic_matching(
             &polygon.boundary,
             &expected,
             |x, y| x == y,
             |x, y| x == y
         ));
+        assert_eq!(cycles, expected_cycles);
     }
 
     #[test]
@@ -800,14 +887,16 @@ mod test {
             ],
             vec![(0, 1), (1, 2), (2, 3), (3, 0), (0, 2), (2, 0)],
         );
+        let expected_cycles = create_decomposition(vec![vec![0, 1, 2], vec![2, 3, 0]]);
 
-        polygon.monotone_decompose();
+        let cycles = testable_decomposition(polygon.monotone_decompose());
         assert!(algo::is_isomorphic_matching(
             &polygon.boundary,
             &expected,
             |x, y| x == y,
             |x, y| x == y
         ));
+        assert_eq!(cycles, expected_cycles);
     }
 
     #[test]
@@ -832,14 +921,16 @@ mod test {
             ],
             vec![(0, 1), (1, 2), (2, 3), (3, 0), (0, 2), (2, 0)],
         );
+        let expected_cycles = create_decomposition(vec![vec![0, 1, 2], vec![2, 3, 0]]);
 
-        polygon.monotone_decompose();
+        let cycles = testable_decomposition(polygon.monotone_decompose());
         assert!(algo::is_isomorphic_matching(
             &polygon.boundary,
             &expected,
             |x, y| x == y,
             |x, y| x == y
         ));
+        assert_eq!(cycles, expected_cycles);
     }
 
     #[test]
@@ -894,14 +985,17 @@ mod test {
                 (6, 1),
             ],
         );
+        let expected_cycles =
+            create_decomposition(vec![vec![0, 1, 6, 7, 4, 3], vec![2, 3, 4, 5, 6, 1]]);
 
-        polygon.monotone_decompose();
+        let cycles = testable_decomposition(polygon.monotone_decompose());
         assert!(algo::is_isomorphic_matching(
             &polygon.boundary,
             &expected,
             |x, y| x == y,
             |x, y| x == y
         ));
+        assert_eq!(cycles, expected_cycles);
     }
 
     #[test]
@@ -970,13 +1064,174 @@ mod test {
                 (7, 5),
             ],
         );
+        let expected_cycles = create_decomposition(vec![
+            vec![0, 1, 3, 7, 8],
+            vec![0, 8, 9],
+            vec![5, 6, 7],
+            vec![3, 4, 5, 7],
+            vec![1, 2, 3],
+        ]);
 
-        polygon.monotone_decompose();
+        let cycles = testable_decomposition(polygon.monotone_decompose());
         assert!(algo::is_isomorphic_matching(
             &polygon.boundary,
             &expected,
             |x, y| x == y,
             |x, y| x == y
         ));
+        assert_eq!(cycles, expected_cycles);
+    }
+
+    #[test]
+    fn test_monotone_triangulation_triangle() {
+        let mut polygon = Polygon::from_boundary(create_graph(
+            vec![vec2(0.0, 0.0), vec2(1.0, 0.0), vec2(1.0, 1.0)],
+            vec![(0, 1), (1, 2), (2, 0)],
+        ))
+        .unwrap();
+        let expected = polygon.boundary.clone();
+        let expected_cycles = create_triangulation(vec![[0, 1, 2]]);
+
+        let monotone = polygon.monotone_decompose();
+        let cycles = testable_triangulation(polygon.triangulate_monotone_cycles(monotone));
+        assert!(algo::is_isomorphic_matching(
+            &polygon.boundary,
+            &expected,
+            |x, y| x == y,
+            |x, y| x == y
+        ));
+        assert_eq!(cycles, expected_cycles);
+    }
+
+    #[test]
+    fn test_monotone_triangulation_sloppy_t() {
+        let mut polygon = Polygon::from_boundary(create_graph(
+            vec![
+                vec2(0.0, 4.0),
+                vec2(2.0, 2.0),
+                vec2(2.0, 0.0),
+                vec2(3.0, 3.0),
+                vec2(6.0, 4.0),
+            ],
+            vec![(0, 1), (1, 2), (2, 3), (3, 4), (4, 0)],
+        ))
+        .unwrap();
+        let expected = create_graph(
+            vec![
+                vec2(0.0, 4.0),
+                vec2(2.0, 2.0),
+                vec2(2.0, 0.0),
+                vec2(3.0, 3.0),
+                vec2(6.0, 4.0),
+            ],
+            vec![
+                (0, 1),
+                (1, 2),
+                (2, 3),
+                (3, 4),
+                (4, 0),
+                (1, 3),
+                (3, 1),
+                (0, 3),
+                (3, 0),
+            ],
+        );
+        let expected_cycles = create_triangulation(vec![[1, 2, 3], [0, 1, 3], [0, 3, 4]]);
+
+        let monotone = polygon.monotone_decompose();
+        let cycles = testable_triangulation(polygon.triangulate_monotone_cycles(monotone));
+        assert!(algo::is_isomorphic_matching(
+            &polygon.boundary,
+            &expected,
+            |x, y| x == y,
+            |x, y| x == y
+        ));
+        assert_eq!(cycles, expected_cycles);
+    }
+
+    #[test]
+    fn test_monotone_triangulation_parallelogram_ring() {
+        // contains a hole
+        let mut polygon = Polygon::from_boundary(create_graph(
+            vec![
+                vec2(0.0, 0.0),
+                vec2(6.0, 0.0),
+                vec2(7.0, 3.0),
+                vec2(1.0, 3.0),
+                vec2(2.0, 1.0),
+                vec2(3.0, 2.0),
+                vec2(5.0, 2.0),
+                vec2(4.0, 1.0),
+            ],
+            vec![
+                (0, 1),
+                (1, 2),
+                (2, 3),
+                (3, 0),
+                (4, 5),
+                (5, 6),
+                (6, 7),
+                (7, 4),
+            ],
+        ))
+        .unwrap();
+        let expected = create_graph(
+            vec![
+                vec2(0.0, 0.0),
+                vec2(6.0, 0.0),
+                vec2(7.0, 3.0),
+                vec2(1.0, 3.0),
+                vec2(2.0, 1.0),
+                vec2(3.0, 2.0),
+                vec2(5.0, 2.0),
+                vec2(4.0, 1.0),
+            ],
+            vec![
+                (0, 1),
+                (1, 2),
+                (2, 3),
+                (3, 0),
+                (4, 5),
+                (5, 6),
+                (6, 7),
+                (7, 4),
+                (3, 4),
+                (4, 3),
+                (1, 6),
+                (6, 1),
+                (0, 4),
+                (4, 0),
+                (0, 7),
+                (7, 0),
+                (1, 7),
+                (7, 1),
+                (2, 6),
+                (6, 2),
+                (2, 5),
+                (5, 2),
+                (3, 5),
+                (5, 3),
+            ],
+        );
+        let expected_cycles = create_triangulation(vec![
+            [0, 7, 4],
+            [0, 1, 7],
+            [1, 6, 7],
+            [1, 2, 6],
+            [2, 5, 6],
+            [2, 3, 5],
+            [3, 4, 5],
+            [3, 0, 4],
+        ]);
+
+        let monotone = polygon.monotone_decompose();
+        let cycles = testable_triangulation(polygon.triangulate_monotone_cycles(monotone));
+        assert!(algo::is_isomorphic_matching(
+            &polygon.boundary,
+            &expected,
+            |x, y| x == y,
+            |x, y| x == y
+        ));
+        assert_eq!(cycles, expected_cycles);
     }
 }
