@@ -27,6 +27,7 @@ pub enum TriangulateError {
 /// neighboring vertices of split lines in clockwise order.
 #[derive(Debug)]
 struct SweepVertex {
+    source: NodeIndex,
     target: NodeIndex,
     kind: SweepKind,
 }
@@ -41,8 +42,12 @@ enum SweepKind {
 }
 
 impl SweepVertex {
-    fn new(target: NodeIndex, kind: SweepKind) -> Self {
-        Self { target, kind }
+    fn new(source: NodeIndex, target: NodeIndex, kind: SweepKind) -> Self {
+        Self {
+            source,
+            target,
+            kind,
+        }
     }
 
     /// Adds the other node of a split line to the right of this node
@@ -72,18 +77,23 @@ impl SweepVertex {
         }
     }
 
-    fn targets(self) -> Vec<NodeIndex> {
-        match self.kind {
-            SweepKind::Start(n) | SweepKind::End(n) => vec![n],
+    fn sources_targets(self) -> Vec<NodeIndex> {
+        std::iter::once(self.source)
+            .chain(
+                match self.kind {
+                    SweepKind::Start(n) | SweepKind::End(n) => vec![n, n],
 
-            SweepKind::Continue([a, b], _) => vec![a, b],
+                    SweepKind::Continue([a, b], _) => vec![a, a, b, b],
 
-            SweepKind::Split([a, b, c]) | SweepKind::Merge([a, b, c]) => vec![a, b, c],
-        }
-        .into_iter()
-        .flatten()
-        .chain(std::iter::once(self.target))
-        .collect()
+                    SweepKind::Split([a, b, c]) | SweepKind::Merge([a, b, c]) => {
+                        vec![a, a, b, b, c, c]
+                    }
+                }
+                .into_iter()
+                .flatten(),
+            )
+            .chain(std::iter::once(self.target))
+            .collect()
     }
 }
 
@@ -176,7 +186,7 @@ impl Polygon {
     fn monotone_cycles(sweep: FnvHashMap<NodeIndex, SweepVertex>) -> Vec<Vec<NodeIndex>> {
         let mut target_map = sweep
             .into_iter()
-            .map(|(k, v)| (k, v.targets()))
+            .map(|(k, v)| (k, v.sources_targets()))
             .collect::<FnvHashMap<_, _>>();
 
         target_map
@@ -196,9 +206,14 @@ impl Polygon {
                 let targets = target_map.get_mut(&node).unwrap();
 
                 let new_node = if prev == node {
+                    targets.remove(targets.len() - 2);
                     targets.pop().unwrap()
                 } else {
-                    todo!()
+                    let index = targets.iter().rposition(|n| *n == prev).unwrap();
+                    let node = targets[index + 1];
+                    targets.remove(index + 1);
+                    targets.remove(index);
+                    node
                 };
 
                 if targets.is_empty() {
@@ -268,6 +283,7 @@ impl Polygon {
             // Nodes exist because each node has an incoming edge and an outgoing edge.
             let mut node_a = boundary.edges_in(node).next().unwrap().source();
             let mut node_b = boundary.edges(node).next().unwrap().target();
+            let in_node = node_a;
             let out_node = node_b;
             let index_a = index_map[&node_a];
             let index_b = index_map[&node_b];
@@ -306,7 +322,7 @@ impl Polygon {
                         // Split vertex
                         sweep_nodes.insert(
                             node,
-                            SweepVertex::new(out_node, SweepKind::Split([None; 3])),
+                            SweepVertex::new(in_node, out_node, SweepKind::Split([None; 3])),
                         );
 
                         // Look at edges above and below and add a diagonal to the one
@@ -324,8 +340,10 @@ impl Polygon {
                         edges[index + 2].2 = Some(node);
                     } else {
                         // Start vertex
-                        sweep_nodes
-                            .insert(node, SweepVertex::new(out_node, SweepKind::Start(None)));
+                        sweep_nodes.insert(
+                            node,
+                            SweepVertex::new(in_node, out_node, SweepKind::Start(None)),
+                        );
                     }
                 }
             } else if index_a < i && index_b < i {
@@ -346,7 +364,7 @@ impl Polygon {
                     // Merge vertex
                     sweep_nodes.insert(
                         node,
-                        SweepVertex::new(out_node, SweepKind::Merge([None; 3])),
+                        SweepVertex::new(in_node, out_node, SweepKind::Merge([None; 3])),
                     );
 
                     for (i, (_, _, helper)) in
@@ -364,7 +382,10 @@ impl Polygon {
                     edges[index + 2].2 = Some(node);
                 } else {
                     // End vertex
-                    sweep_nodes.insert(node, SweepVertex::new(out_node, SweepKind::End(None)));
+                    sweep_nodes.insert(
+                        node,
+                        SweepVertex::new(in_node, out_node, SweepKind::End(None)),
+                    );
 
                     if let Some(helper) = vec![edges[index], edges[index + 1]]
                         .into_iter()
@@ -389,7 +410,7 @@ impl Polygon {
 
                 sweep_nodes.insert(
                     node,
-                    SweepVertex::new(out_node, SweepKind::Continue([None; 2], flipped)),
+                    SweepVertex::new(in_node, out_node, SweepKind::Continue([None; 2], flipped)),
                 );
 
                 let index = edges
@@ -426,6 +447,7 @@ mod test {
     use fnv::FnvHasher;
     use petgraph::algo;
     use petgraph::data::{Element, FromElements};
+    use std::fmt::Debug;
     use std::hash::{Hash, Hasher};
     use std::num::Wrapping;
 
@@ -457,19 +479,19 @@ mod test {
     }
 
     #[derive(Clone, Debug, Eq)]
-    struct Ring<T: Clone + Eq + Hash>(VecDeque<T>);
+    struct Ring<T: Clone + Debug + Eq + Hash>(VecDeque<T>);
 
-    impl<T: Clone + Eq + Hash> PartialEq for Ring<T> {
+    impl<T: Clone + Debug + Eq + Hash> PartialEq for Ring<T> {
         fn eq(&self, other: &Self) -> bool {
             let mut rotatable = other.0.clone();
-            (0..self.0.len()).into_iter().all(|_| {
+            (0..self.0.len()).into_iter().any(|_| {
                 rotatable.rotate_right(1);
                 rotatable == self.0
             })
         }
     }
 
-    impl<T: Clone + Eq + Hash> Hash for Ring<T> {
+    impl<T: Clone + Debug + Eq + Hash> Hash for Ring<T> {
         fn hash<H: Hasher>(&self, state: &mut H) {
             let int = self
                 .0
@@ -682,7 +704,7 @@ mod test {
             ],
             vec![(0, 1), (1, 2), (2, 3), (3, 0), (1, 3), (3, 1)],
         );
-        let expected_cycles = create_decomposition(vec![vec![0, 1, 2], vec![3, 2, 1]]);
+        let expected_cycles = create_decomposition(vec![vec![0, 1, 3], vec![2, 3, 1]]);
 
         let cycles = testable_decomposition(polygon.monotone_decompose());
         assert!(algo::is_isomorphic_matching(
