@@ -32,6 +32,30 @@ impl Hash for HashVec2 {
     }
 }
 
+/// A `Vec3` that can be hashed
+#[derive(Copy, Clone, Debug)]
+pub struct HashVec3(pub Vec3);
+
+impl HashVec3 {
+    fn float_ord(self) -> (FloatOrd<f64>, FloatOrd<f64>, FloatOrd<f64>) {
+        (FloatOrd(self.0.x), FloatOrd(self.0.y), FloatOrd(self.0.z))
+    }
+}
+
+impl PartialEq for HashVec3 {
+    fn eq(&self, other: &Self) -> bool {
+        self.float_ord() == other.float_ord()
+    }
+}
+
+impl Eq for HashVec3 {}
+
+impl Hash for HashVec3 {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.float_ord().hash(state)
+    }
+}
+
 pub trait GraphEx {
     type Edge;
     type Type: EdgeType;

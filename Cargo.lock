@@ -464,7 +464,7 @@ dependencies = [
 [[package]]
 name = "tri-mesh"
 version = "0.5.0"
-source = "git+https://github.com/josh65536/tri-mesh#1693e2e79a07aba35e70a2ede07e3112363897c2"
+source = "git+https://github.com/josh65536/tri-mesh#f7ae1ac69df216893a8fcd39cd40c72acf0742c9"
 dependencies = [
  "bincode",
  "cgmath 0.16.1",

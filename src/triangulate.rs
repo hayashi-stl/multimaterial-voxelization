@@ -137,7 +137,7 @@ impl Polygon {
             // Pair outgoing edges with incoming edges and split vertex.
             // Optimize for not having self-intersections
             while targets.len() > 2 {
-                let mut iter = targets.iter().cycle();
+                let mut iter = targets.iter().chain(targets.iter());
                 let out_index = iter
                     .position(|(_, dir)| *dir == Direction::Outgoing)
                     .unwrap();

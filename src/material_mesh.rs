@@ -1,7 +1,8 @@
 use float_ord::FloatOrd;
-use fnv::FnvHashMap;
+use fnv::{FnvHashMap, FnvHashSet};
 use petgraph::graph::Edges;
 use petgraph::prelude::*;
+use petgraph::unionfind::UnionFind;
 use std::fs;
 use std::num::NonZeroU32;
 use std::path::Path;
@@ -9,7 +10,7 @@ use tri_mesh::mesh_builder;
 use tri_mesh::prelude::*;
 
 use crate::triangulate::Polygon;
-use crate::util::{GraphEx, HashVec2, Vec2};
+use crate::util::{GraphEx, HashVec2, HashVec3, Vec2};
 
 /// The ID type for a material
 /// 0 is reserved for the absence of a material
@@ -70,6 +71,16 @@ impl MaterialMesh {
     pub fn export_debug_obj<P: AsRef<Path>>(&self, path: P) {
         let obj = self.mesh.parse_as_obj();
         fs::write(path, obj).expect("Could not debug obj");
+    }
+
+    pub fn debug_vertices_faces(&self) {
+        for v in self.mesh.vertex_iter() {
+            println!("vertex {}: {:?}", v, self.mesh.vertex_position(v));
+        }
+        for f in self.mesh.face_iter() {
+            let (a, b, c) = self.mesh.face_vertices(f);
+            println!("face {} {} {}", a, b, c);
+        }
     }
 
     /// Constructs a material mesh with 1 material from an OBJ string
@@ -307,10 +318,9 @@ impl MaterialMesh {
         let t = (slice_coord - min) / (max - min);
         let mut inter = vec3(
             slice_coord,
-            pos.0[(axis_id + 1) % 3] * (1.0 - t) + pos.1[(axis_id + 1) % 3] * t,
-            pos.0[(axis_id + 2) % 3] * (1.0 - t) + pos.1[(axis_id + 2) % 3] * t,
+            pos.0[(axis_id + 1) % 3] + (pos.1[(axis_id + 1) % 3] - pos.0[(axis_id + 1) % 3]) * t,
+            pos.0[(axis_id + 2) % 3] + (pos.1[(axis_id + 2) % 3] - pos.0[(axis_id + 2) % 3]) * t,
         );
-
         // Rotate vector properly
         for _ in 0..axis_id {
             inter = vec3(inter.z, inter.x, inter.y);
@@ -879,7 +889,7 @@ impl MaterialMesh {
                 let center = self.mesh.face_center(f);
                 let pos = self.mesh.face_positions(f);
                 // Technically need to divide by 2, but it doesn't matter
-                (center.z - 1.0) * (pos.1 - pos.0).cross(pos.2 - pos.0).dot(Vec3::unit_z())
+                (center.z - -1.0) * (pos.1 - pos.0).cross(pos.2 - pos.0).dot(Vec3::unit_z())
             })
             .sum::<f64>();
 
@@ -908,6 +918,8 @@ impl MaterialMesh {
         if !Self::intersect_center_unit_square_on_graph(&mut boundary) {
             mesh_fn().intersect_center_unit_square_with_context(&mut boundary);
         }
+
+        boundary.reverse();
 
         Polygon::from_boundary(boundary)
             .expect("Bad complex voxel boundary")
@@ -992,7 +1004,107 @@ impl MaterialMesh {
             );
         }
 
-        self
+        let mesh = Self::manifold_from_triangle_soup(triangles);
+        MaterialMesh::new(mesh.mesh.translated(cube_min + vec3(0.5, 0.5, 0.5)))
+    }
+
+    /// Constructs a manifold mesh, possibly with boundary,
+    /// from a triangle soup by combining overlapping edges.
+    fn manifold_from_triangle_soup(triangles: Vec<[Vec3; 3]>) -> Self {
+        let positions = triangles
+            .into_iter()
+            .flat_map(|[a, b, c]| vec![a, b, c].into_iter())
+            .collect::<Vec<_>>();
+
+        let mut index_sets = UnionFind::new(positions.len());
+
+        let mut edge_face_map = FnvHashMap::default();
+        for (i, pos) in positions.iter().enumerate() {
+            edge_face_map
+                .entry((HashVec3(*pos), HashVec3(positions[i / 3 * 3 + (i + 1) % 3])))
+                .or_insert(vec![])
+                .push(i)
+        }
+
+        // Link edges together
+        while let Some((e0, e1)) = edge_face_map.keys().next().copied() {
+            let indexes_fwd = edge_face_map.remove(&(e0, e1)).unwrap();
+            let indexes_inv = edge_face_map.remove(&(e1, e0)).unwrap_or(vec![]);
+            let (e0, e1) = (e0.0, e1.0);
+            let dir = (e1 - e0).normalize();
+            // Some vector perpendicular to the edge direction
+            let perp = if dir.dot(Vec3::unit_x()).abs() > 0.9 {
+                dir.cross(Vec3::unit_y())
+            } else {
+                dir.cross(Vec3::unit_x())
+            };
+
+            let mut angles_dirs = indexes_fwd
+                .into_iter()
+                .map(|i| (i, true))
+                .chain(indexes_inv.into_iter().map(|i| (i, false)))
+                .collect::<Vec<_>>();
+
+            // Sort by angle around the edge, and make sure inverse faces appear after forward faces in case of a tie
+            angles_dirs.sort_by_key(|(i, fwd)| {
+                let vec_out = positions[i / 3 * 3 + (i + 2) % 3] - e0;
+                let proj = vec_out - vec_out.project_on(dir);
+                (
+                    FloatOrd(perp.cross(proj).dot(dir).atan2(perp.dot(proj))),
+                    !fwd,
+                )
+            });
+
+            while let (Some(inv_index), Some(fwd_index)) = {
+                let mut iter = angles_dirs.iter().chain(angles_dirs.iter());
+                let inv = iter.position(|(_, fwd)| !*fwd);
+                let fwd = iter
+                    .position(|(_, fwd)| *fwd)
+                    .map(|i| (i + inv.unwrap_or(0) + 1) % angles_dirs.len());
+                (inv, fwd)
+            } {
+                let inv_i = angles_dirs[inv_index].0;
+                let inv_j = inv_i / 3 * 3 + (inv_i + 1) % 3;
+                let fwd_i = angles_dirs[fwd_index].0;
+                let fwd_j = fwd_i / 3 * 3 + (fwd_i + 1) % 3;
+
+                // Remember that they wind the edge in opposite directions
+                index_sets.union(inv_i, fwd_j);
+                index_sets.union(inv_j, fwd_i);
+
+                angles_dirs.remove(inv_index.max(fwd_index));
+                angles_dirs.remove(inv_index.min(fwd_index));
+            }
+        }
+
+        let rep_map = index_sets.into_labeling();
+        let index_map = rep_map
+            .iter()
+            .collect::<FnvHashSet<_>>()
+            .iter()
+            .enumerate()
+            .map(|(i, rep)| (*rep, i))
+            .collect::<FnvHashMap<_, _>>();
+
+        let mut points = vec![0.0; index_map.len() * 3];
+        let mut indexes = vec![];
+
+        for (i, pos) in positions.into_iter().enumerate() {
+            let index = index_map[&rep_map[i]];
+            indexes.push(index as u32);
+            points[3 * index + 0] = pos.x;
+            points[3 * index + 1] = pos.y;
+            points[3 * index + 2] = pos.z;
+        }
+
+        MaterialMesh::new(
+            MeshBuilder::new()
+                .with_positions(points)
+                .with_indices(indexes)
+                .with_default_tag(MaterialID::new(1))
+                .build()
+                .expect("Invalid mesh"),
+        )
     }
 }
 
@@ -1658,5 +1770,133 @@ mod test {
             |x, y| x == y,
             |x, y| x == y
         ));
+    }
+
+    #[test]
+    fn test_manifold_triangle() {
+        let triangles = vec![[
+            vec3(0.0, 0.0, 0.0),
+            vec3(1.0, 0.0, 0.0),
+            vec3(0.0, 1.0, 0.0),
+        ]];
+        let mesh = MaterialMesh::manifold_from_triangle_soup(triangles);
+
+        assert_eq!(mesh.mesh.num_vertices(), 3);
+        assert_eq!(mesh.mesh.num_edges(), 3);
+        assert_eq!(mesh.mesh.num_faces(), 1);
+    }
+
+    #[test]
+    fn test_manifold_square() {
+        let triangles = vec![
+            [
+                vec3(0.0, 0.0, 0.0),
+                vec3(1.0, 0.0, 0.0),
+                vec3(0.0, 1.0, 0.0),
+            ],
+            [
+                vec3(1.0, 1.0, 0.0),
+                vec3(0.0, 1.0, 0.0),
+                vec3(1.0, 0.0, 0.0),
+            ],
+        ];
+        let mesh = MaterialMesh::manifold_from_triangle_soup(triangles);
+
+        assert_eq!(mesh.mesh.num_vertices(), 4);
+        assert_eq!(mesh.mesh.num_edges(), 5);
+        assert_eq!(mesh.mesh.num_faces(), 2);
+    }
+
+    #[test]
+    fn test_manifold_tetraflap_with_pairs() {
+        let triangles = vec![
+            [
+                vec3(0.0, 0.0, 0.0),
+                vec3(2.0, 1.0, 0.0),
+                vec3(0.0, 2.0, 0.0),
+            ],
+            [
+                vec3(0.0, 2.0, 0.0),
+                vec3(0.0, 1.0, 2.0),
+                vec3(0.0, 0.0, 0.0),
+            ],
+            [
+                vec3(0.0, 0.0, 0.0),
+                vec3(-2.0, 1.0, 0.0),
+                vec3(0.0, 2.0, 0.0),
+            ],
+            [
+                vec3(0.0, 2.0, 0.0),
+                vec3(0.0, 1.0, -2.0),
+                vec3(0.0, 0.0, 0.0),
+            ],
+        ];
+        let mesh = MaterialMesh::manifold_from_triangle_soup(triangles);
+
+        assert_eq!(mesh.mesh.num_vertices(), 8);
+        assert_eq!(mesh.mesh.num_edges(), 10);
+        assert_eq!(mesh.mesh.num_faces(), 4);
+    }
+
+    #[test]
+    fn test_manifold_tetrahedron() {
+        let triangles = vec![
+            [
+                vec3(0.0, 0.0, 0.0),
+                vec3(1.0, 0.0, 1.0),
+                vec3(0.0, 1.0, 1.0),
+            ],
+            [
+                vec3(1.0, 1.0, 0.0),
+                vec3(0.0, 1.0, 1.0),
+                vec3(1.0, 0.0, 1.0),
+            ],
+            [
+                vec3(0.0, 0.0, 0.0),
+                vec3(1.0, 1.0, 0.0),
+                vec3(1.0, 0.0, 1.0),
+            ],
+            [
+                vec3(1.0, 1.0, 0.0),
+                vec3(0.0, 0.0, 0.0),
+                vec3(0.0, 1.0, 1.0),
+            ],
+        ];
+        let mesh = MaterialMesh::manifold_from_triangle_soup(triangles);
+
+        assert_eq!(mesh.mesh.num_vertices(), 4);
+        assert_eq!(mesh.mesh.num_edges(), 6);
+        assert_eq!(mesh.mesh.num_faces(), 4);
+    }
+
+    #[test]
+    fn test_intersect_unit_cube_diagonal_plane() {
+        let mesh = create_mesh(
+            vec![0.0, 1.0, 0.0, 1.0, 0.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 1.0],
+            vec![0, 1, 2, 2, 3, 0],
+        );
+        let expected_vertices = vec![
+            (0.0, 1.0, 0.0),
+            (1.0, 0.0, 0.0),
+            (1.0, 0.0, 1.0),
+            (0.0, 1.0, 1.0),
+            (1.0, 1.0, 0.0),
+            (1.0, 1.0, 1.0),
+        ]
+        .into_iter()
+        .map(|(x, y, z)| HashVec3(vec3(x, y, z)))
+        .collect::<FnvHashSet<_>>();
+
+        let mesh = mesh.intersect_unit_cube(Vec3::zero());
+        let vertices = mesh
+            .mesh
+            .vertex_iter()
+            .map(|v| HashVec3(mesh.mesh.vertex_position(v)))
+            .collect::<FnvHashSet<_>>();
+
+        // Right triangular prism expected
+        assert_eq!(vertices, expected_vertices);
+        assert_eq!(mesh.mesh.num_edges(), 12);
+        assert_eq!(mesh.mesh.num_faces(), 8);
     }
 }

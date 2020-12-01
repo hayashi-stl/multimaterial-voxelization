@@ -157,6 +157,14 @@ impl Voxels {
         slices: Vec<(Vec3, MaterialMesh)>,
         chunks: FnvHashMap<Vec3i, ComplexChunk>,
     ) -> FnvHashMap<Vec3i, ComplexChunk> {
+        for (pos, slice) in slices {
+            let mesh = slice.intersect_unit_cube(pos);
+            mesh.export_debug_obj(format!(
+                "assets/debug/complex/cube_{:04}_{:04}_{:04}.obj",
+                pos.x, pos.y, pos.z
+            ));
+        }
+
         chunks
     }
 
@@ -297,6 +305,28 @@ impl From<MaterialMesh> for Voxels {
 
         voxels.chunks.extend(complex_chunks.into_iter());
 
+        //let objs = std::fs::read_dir("assets/debug/complex")
+        //    .unwrap()
+        //    .flat_map(|entry| {
+        //        let path = entry.unwrap().path();
+        //        if path.is_file() {
+        //            Some(std::fs::read_to_string(path).unwrap())
+        //        } else {
+        //            None
+        //        }
+        //    }).collect::<Vec<_>>();
+        //let len = objs.len();
+        //let mesh = objs
+        //    .into_iter()
+        //    .enumerate()
+        //    .fold(MeshBuilder::<MaterialID>::new().with_positions(vec![]).build().unwrap(), |mut mesh, (i, obj)| {
+        //        let m = MeshBuilder::new().with_obj(obj).build().unwrap();
+        //        mesh.append(&m);
+        //        println!("{}/{}", i, len);
+        //        mesh
+        //    });
+        //MaterialMesh::new(mesh).export_debug_obj("assets/debug/complex_voxels_2.obj");
+
         voxels
     }
 }
@@ -310,6 +340,14 @@ pub enum Chunk {
 
 impl Chunk {
     pub const SIZE: usize = 16;
+
+    fn is_uniform(&self) -> bool {
+        if let Chunk::Uniform(_) = self {
+            true
+        } else {
+            false
+        }
+    }
 }
 
 /// A complex chunk. Contains a grid of voxels.

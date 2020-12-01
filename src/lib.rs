@@ -5,6 +5,7 @@ extern crate rayon;
 extern crate tri_mesh;
 
 pub mod material_mesh;
+pub mod tetrahedralize;
 pub mod triangulate;
 pub mod util;
 pub mod voxels;
