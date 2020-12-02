@@ -3,6 +3,7 @@ use fnv::{FnvHashMap, FnvHashSet};
 use petgraph::prelude::*;
 use std::path::Path;
 use tri_mesh::prelude::*;
+use stable_vec::StableVec;
 
 /// A tetrahedralization of a bunch of points.
 /// Uses Bowyer's algorithm
@@ -205,12 +206,8 @@ impl DelaunayTetrahedralization {
     }
 
     /// Adds the next point to the tetrahedralization
-    fn add_point(&mut self) {
-        let point = match self.points_to_add.pop() {
-            Some(point) => point,
-            None => return,
-        };
-
+    /// Returns (tet edges removed, tet edges added)
+    pub fn add_point(&mut self, point: Vec3) -> (Vec<(usize, usize)>, Vec<(usize, usize)>) {
         // Find all vertices to delete
         let v_delete = self.find_vertices_to_delete(point);
 
@@ -275,8 +272,16 @@ impl DelaunayTetrahedralization {
         }
 
         // Add new point adjacencies
+        let mut edges_added = vec![];
         for point in &near_points {
             self.tet_edges.add_edge(*point, p_index, ());
+            
+            if point.index() >= 4 && p_index.index() >= 4 {
+                edges_added.push((
+                    if *point < p_index { point.index() } else { p_index.index() } - 4,
+                    if *point < p_index { p_index.index() } else { point.index() } - 4
+                ));
+            }
         }
 
         // Add new adjacenices from points to vertices
@@ -312,6 +317,7 @@ impl DelaunayTetrahedralization {
             })
             .collect::<FnvHashSet<_>>();
 
+        let mut edges_removed = vec![];
         for edge in edges {
             let (s, t) = self.tet_edges.edge_endpoints(edge).unwrap();
             let vs = &self.point_vertices[s.index()];
@@ -319,24 +325,39 @@ impl DelaunayTetrahedralization {
 
             if vs.is_disjoint(&vt) {
                 self.tet_edges.remove_edge(edge);
+
+                if s.index() >= 4 && t.index() >= 4 {
+                    edges_removed.push((
+                        if s < t { s.index() } else { t.index() } - 4,
+                        if s < t { t.index() } else { s.index() } - 4,
+                    ))
+                }
             }
         }
+
+        (edges_removed, edges_added)
     }
 
     /// Constructs a tetrahedralization of the input points.
     pub fn new(points: Vec<Vec3>) -> Self {
         let mut tet = Self::init(points);
 
-        while !tet.points_to_add.is_empty() {
-            tet.add_point();
+        while let Some(point) = tet.points_to_add.pop() {
+            tet.add_point(point);
         }
 
         tet
     }
 
     /// Obtain the tetrahedrons of the tetrahedralization
-    pub fn tetrahedrons<'a>(&'a self) -> impl Iterator<Item = [usize; 4]> + 'a {
-        self.voronoi
+    pub fn tetrahedrons(&self) -> (Vec<Vec3>, Vec<[usize; 4]>) {
+        let positions = self.tet_edges
+            .node_indices()
+            .skip(4)
+            .map(|p| self.tet_edges[p])
+            .collect();
+
+        let tets = self.voronoi
             .node_indices()
             .filter(move |v| v.index() != 0)
             .map(move |v| {
@@ -350,6 +371,21 @@ impl DelaunayTetrahedralization {
             .filter(|tet| tet.iter().all(|i| *i >= 4))
             // Subtract 4 to ignore outer tetrahedron points
             .map(|[p0, p1, p2, p3]| [p0 - 4, p1 - 4, p2 - 4, p3 - 4])
+            .collect();
+
+        (positions, tets)
+    }
+
+    /// Obtain the edges of the tetrahedrons
+    pub fn tetrahedron_edges<'a>(&'a self) -> impl Iterator<Item = (usize, usize)> + 'a {
+        self.tet_edges
+            .edge_indices()
+            .map(move |e| {
+                let (s, t) = self.tet_edges.edge_endpoints(e).unwrap();
+                (s.index(), t.index())
+            })
+            .filter(|(s, t)| *s >= 4 && *t >= 4)
+            .map(|(s, t)| (s - 4, t - 4))
     }
 
     pub fn export_debug_obj<P: AsRef<Path>>(&self, path: P) {
@@ -366,6 +402,42 @@ impl DelaunayTetrahedralization {
         }
 
         std::fs::write(path, output).expect("Could not debug obj");
+    }
+}
+
+/// A tetrahedralization that isn't necessarily Delaunay.
+#[derive(Clone, Debug)]
+struct Tetrahedralization {
+    /// Vertices are tetrahedrons and edges are
+    /// adjacencies, with the tet vertex
+    /// on the opposite side of the edge as the weight.
+    /// Vertex 0 is reserved for the not-so-tetra-hedron at infinity.
+    tets: StableGraph<(), usize>,
+    /// Vertex positions and adjacent tetrahedrons (not including one at infinity)
+    vertices: StableVec<(Vec3, FnvHashSet<NodeIndex>)>,
+}
+
+impl Tetrahedralization {
+    pub fn new(positions: Vec<Vec3>, tetrahedrons: Vec<[usize; 4]>) -> Self {
+        let mut tets = StableGraph::new();
+        let mut vertices = positions
+            .into_iter()
+            .map(|pos| (pos, FnvHashSet::<NodeIndex>::default()))
+            .collect::<StableVec<_>>();
+
+        tets.add_node(()); // not-so-tetra-hedron at infinity
+        for _ in 0..tetrahedrons.len() {
+            tets.add_node(());
+        }
+
+        for (i, tet) in tetrahedrons.into_iter().enumerate() {
+            let i = NodeIndex::new(i + 1);
+            for v in tet.iter() {
+                vertices[*v].1.insert(i);
+            }
+        }
+
+        Self { tets, vertices }
     }
 }
 
@@ -487,8 +559,7 @@ mod test {
         let exp_tets = tetrahedrons(vec![[0, 1, 2, 3]]);
         let tets = tetrahedrons(
             DelaunayTetrahedralization::new(points)
-                .tetrahedrons()
-                .collect(),
+                .tetrahedrons().1
         );
 
         assert_eq!(tets, exp_tets);
@@ -507,8 +578,7 @@ mod test {
         let exp_tets = tetrahedrons(vec![[0, 1, 2, 3], [0, 1, 2, 4]]);
         let tets = tetrahedrons(
             DelaunayTetrahedralization::new(points)
-                .tetrahedrons()
-                .collect(),
+                .tetrahedrons().1
         );
 
         assert_eq!(tets, exp_tets);
@@ -527,8 +597,7 @@ mod test {
         let exp_tets = tetrahedrons(vec![[0, 1, 3, 4], [1, 2, 3, 4], [2, 0, 3, 4]]);
         let tets = tetrahedrons(
             DelaunayTetrahedralization::new(points)
-                .tetrahedrons()
-                .collect(),
+                .tetrahedrons().1
         );
 
         assert_eq!(tets, exp_tets);
@@ -539,12 +608,34 @@ mod test {
     //    let points = vec![
     //        vec3(0.0, 0.0, 0.0),
     //        vec3(2.0, 0.0, 0.0),
-    //        vec3(1.0, 2.0, 0.0),
-    //        vec3(1.0, 1.0, 0.5),
-    //        vec3(1.0, 1.0, -0.5)
+    //        vec3(2.0, 0.0, 1.0),
+    //        vec3(3.0, 0.0, 1.0),
+    //        vec3(3.0, 0.0, 3.0),
+    //        vec3(0.0, 0.0, 3.0),
+    //        vec3(0.0, 3.0, 0.0),
+    //        vec3(2.0, 3.0, 0.0),
+    //        vec3(2.0, 3.0, 1.0),
+    //        vec3(3.0, 3.0, 1.0),
+    //        vec3(3.0, 3.0, 3.0),
+    //        vec3(0.0, 3.0, 3.0),
     //    ];
     //    let dt = DelaunayTetrahedralization::new(points);
 
     //    dt.export_debug_obj("assets/debug/dt_test.obj");
+    //}
+
+    //#[test]
+    //fn export_debug_obj() {
+    //    let points = vec![
+    //        vec3(1.0, 0.0, 0.0),
+    //        vec3(-0.5, 0.0, -0.75f64.sqrt()),
+    //        vec3(-0.5, 0.0, 0.75f64.sqrt()),
+    //        vec3(0.75f64.sqrt(), 1.5, -0.5),
+    //        vec3(-0.75f64.sqrt(), 1.5, -0.5),
+    //        vec3(0.0, 1.5, 1.0),
+    //    ];
+    //    let dt = DelaunayTetrahedralization::new(points);
+
+    //    dt.export_debug_obj("assets/debug/dt_test2.obj");
     //}
 }
