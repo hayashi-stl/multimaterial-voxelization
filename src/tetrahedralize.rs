@@ -1,9 +1,9 @@
 use float_ord::FloatOrd;
 use fnv::{FnvHashMap, FnvHashSet};
 use petgraph::prelude::*;
+use stable_vec::StableVec;
 use std::path::Path;
 use tri_mesh::prelude::*;
-use stable_vec::StableVec;
 
 /// A tetrahedralization of a bunch of points.
 /// Uses Bowyer's algorithm
@@ -275,11 +275,19 @@ impl DelaunayTetrahedralization {
         let mut edges_added = vec![];
         for point in &near_points {
             self.tet_edges.add_edge(*point, p_index, ());
-            
+
             if point.index() >= 4 && p_index.index() >= 4 {
                 edges_added.push((
-                    if *point < p_index { point.index() } else { p_index.index() } - 4,
-                    if *point < p_index { p_index.index() } else { point.index() } - 4
+                    if *point < p_index {
+                        point.index()
+                    } else {
+                        p_index.index()
+                    } - 4,
+                    if *point < p_index {
+                        p_index.index()
+                    } else {
+                        point.index()
+                    } - 4,
                 ));
             }
         }
@@ -351,13 +359,15 @@ impl DelaunayTetrahedralization {
 
     /// Obtain the tetrahedrons of the tetrahedralization
     pub fn tetrahedrons(&self) -> (Vec<Vec3>, Vec<[usize; 4]>) {
-        let positions = self.tet_edges
+        let positions = self
+            .tet_edges
             .node_indices()
             .skip(4)
             .map(|p| self.tet_edges[p])
             .collect();
 
-        let tets = self.voronoi
+        let tets = self
+            .voronoi
             .node_indices()
             .filter(move |v| v.index() != 0)
             .map(move |v| {
@@ -408,36 +418,299 @@ impl DelaunayTetrahedralization {
 /// A tetrahedralization that isn't necessarily Delaunay.
 #[derive(Clone, Debug)]
 struct Tetrahedralization {
-    /// Vertices are tetrahedrons and edges are
-    /// adjacencies, with the tet vertex
-    /// on the opposite side of the edge as the weight.
-    /// Vertex 0 is reserved for the not-so-tetra-hedron at infinity.
-    tets: StableGraph<(), usize>,
-    /// Vertex positions and adjacent tetrahedrons (not including one at infinity)
-    vertices: StableVec<(Vec3, FnvHashSet<NodeIndex>)>,
+    /// Vertex positions and adjacent tetrahedrons. Tet vertices are sorted.
+    vertices: StableVec<(Vec3, FnvHashSet<usize>)>,
+    /// Faces and adjacent tetrahedrons, for convenience. Face and tet vertices are sorted.
+    faces: FnvHashMap<[usize; 3], FnvHashSet<usize>>,
+    tets: StableVec<[usize; 4]>,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum EdgeFlex {
+    Convex,
+    Flat,
+    Concave,
 }
 
 impl Tetrahedralization {
+    const EPSILON: f64 = 1e-5;
+
     pub fn new(positions: Vec<Vec3>, tetrahedrons: Vec<[usize; 4]>) -> Self {
-        let mut tets = StableGraph::new();
         let mut vertices = positions
             .into_iter()
-            .map(|pos| (pos, FnvHashSet::<NodeIndex>::default()))
+            .map(|pos| (pos, FnvHashSet::default()))
             .collect::<StableVec<_>>();
 
-        tets.add_node(()); // not-so-tetra-hedron at infinity
-        for _ in 0..tetrahedrons.len() {
-            tets.add_node(());
-        }
+        let mut faces = FnvHashMap::<[usize; 3], FnvHashSet<usize>>::default();
 
-        for (i, tet) in tetrahedrons.into_iter().enumerate() {
-            let i = NodeIndex::new(i + 1);
+        let mut tets = StableVec::new();
+
+        for mut tet in tetrahedrons.into_iter() {
+            tet.sort();
+            let i = tets.push(tet);
+
             for v in tet.iter() {
                 vertices[*v].1.insert(i);
             }
+
+            for j in 0..4 {
+                // Keep sorted order
+                let face = [
+                    tet[0 + (j <= 0) as usize],
+                    tet[1 + (j <= 1) as usize],
+                    tet[2 + (j <= 2) as usize],
+                ];
+                faces.entry(face).or_insert(FnvHashSet::default()).insert(i);
+            }
         }
 
-        Self { tets, vertices }
+        Self {
+            vertices,
+            faces,
+            tets,
+        }
+    }
+
+    /// Assumes tet is sorted, faces returned are sorted
+    fn tet_faces(tet: [usize; 4]) -> impl Iterator<Item = [usize; 3]> {
+        (0..4).map(move |i| {
+            [
+                tet[0 + (i <= 0) as usize],
+                tet[1 + (i <= 1) as usize],
+                tet[2 + (i <= 2) as usize],
+            ]
+        })
+    }
+
+    /// Assumes face is sorted, edges returned are sorted
+    fn face_edges(face: [usize; 3]) -> impl Iterator<Item = [usize; 2]> {
+        (0..3).map(move |i| [face[0 + (i <= 0) as usize], face[1 + (i <= 1) as usize]])
+    }
+
+    /// Assumes face is sorted
+    fn face_tet_indexes_and_tets<'a>(
+        &'a self,
+        face: [usize; 3],
+    ) -> impl Iterator<Item = (usize, [usize; 4])> + 'a {
+        self.faces[&face].iter().map(move |i| (*i, self.tets[*i]))
+    }
+
+    /// Gets index of tet, if the tet exists.
+    /// Assumes tet is sorted.
+    fn tet_index(&self, tet: [usize; 4]) -> Option<usize> {
+        self.face_tet_indexes_and_tets([tet[0], tet[1], tet[2]])
+            .find(|(i, test_tet)| *test_tet == tet)
+            .map(|(i, _)| i)
+    }
+
+    /// Vertex opposite a face in a tet.
+    /// Assumes face and tet are sorted
+    fn opposite_vertex_of_face(tet: [usize; 4], face: [usize; 3]) -> usize {
+        for i in 0..3 {
+            if tet[i] != face[i] {
+                return tet[i];
+            }
+        }
+        tet[3]
+    }
+
+    /// Vertex opposite an edge in a face.
+    /// Assumes edge and face are sorted
+    fn opposite_vertex_of_edge(face: [usize; 3], edge: [usize; 2]) -> usize {
+        for i in 0..2 {
+            if face[i] != edge[i] {
+                return face[i];
+            }
+        }
+        face[2]
+    }
+
+    /// Adds a tet. Assumes the tet is sorted.
+    fn add_tet(&mut self, tet: [usize; 4]) {
+        let index = self.tets.push(tet);
+
+        for v in tet.iter() {
+            self.vertices[*v].1.insert(index);
+        }
+
+        for face in Self::tet_faces(tet) {
+            self.faces
+                .entry(face)
+                .or_insert(FnvHashSet::default())
+                .insert(index);
+        }
+    }
+
+    /// Removes a tet by index, assuming it exists.
+    fn remove_tet(&mut self, index: usize) {
+        let tet = self.tets.remove(index).unwrap();
+
+        for v in tet.iter() {
+            self.vertices[*v].1.remove(&index);
+        }
+
+        for face in Self::tet_faces(tet) {
+            self.faces.get_mut(&face).unwrap().remove(&index);
+            if self.faces.get(&face).unwrap().is_empty() {
+                self.faces.remove(&face);
+            }
+        }
+    }
+
+    /// Calculate the flex of an edge [e1, e2] in
+    /// tetrahedrons [e1, e2, v_e, v_f1] and [e1, e2, v_e, v_f2]
+    /// Assumes edge is sorted
+    fn edge_flex(&self, edge: [usize; 2], v_e: usize, v_f1: usize, v_f2: usize) -> EdgeFlex {
+        let pos_e1 = self.vertices[edge[0]].0;
+        let pos_e = self.vertices[edge[1]].0 - pos_e1;
+        let pos_v = self.vertices[v_e].0 - pos_e1;
+        let pos_f1 = self.vertices[v_f1].0 - pos_e1;
+        let pos_f2 = self.vertices[v_f2].0 - pos_e1;
+
+        // Obtain normals of faces adjacent to edge
+        let mut normal1 = pos_e.cross(pos_f1).normalize();
+        let mut normal2 = pos_f2.cross(pos_e).normalize();
+
+        // Point them in the right direction, away from v_e
+        if normal1.dot(pos_v) > 0.0 {
+            normal1 *= -1.0;
+            normal2 *= -1.0;
+        }
+
+        // Normalize normal in case exterior dihedral angle is close to 0° or 360°
+        let normal = (normal1 + normal2).normalize();
+        let dot = normal.dot(pos_f1);
+
+        if dot.abs() < Self::EPSILON {
+            EdgeFlex::Flat
+        } else if dot < 0.0 {
+            EdgeFlex::Convex
+        } else {
+            EdgeFlex::Concave
+        }
+    }
+
+    /// Flips away a face as part of Shewchuk's algorithm
+    /// for inserting constraining faces into a tetrahedralization
+    /// via flips.
+    /// Returns whether the flip happened.
+    pub fn flip(&mut self, mut face: [usize; 3]) -> bool {
+        face.sort();
+
+        let mut iter = self.face_tet_indexes_and_tets(face);
+        let s = iter.next();
+        // Obtain adjacent tetrahedrons
+        let ((s, s_tet), (t, t_tet)) = match (s, iter.next()) {
+            (Some((s, s_tet)), Some((t, t_tet))) => ((s, s_tet), (t, t_tet)),
+            _ => return false,
+        };
+        std::mem::drop(iter);
+
+        // vertices of tets to remove/add
+        let mut v_remove = vec![];
+        let s_own = Self::opposite_vertex_of_face(s_tet, face);
+        let t_own = Self::opposite_vertex_of_face(t_tet, face);
+        let mut v_add = vec![s_own, t_own];
+
+        for edge in Self::face_edges(face) {
+            let vertex = Self::opposite_vertex_of_edge(face, edge);
+
+            match self.edge_flex(edge, vertex, s_own, t_own) {
+                EdgeFlex::Convex => v_remove.push(vertex),
+                EdgeFlex::Concave => v_add.push(vertex),
+                EdgeFlex::Flat => {} // One less vertex
+            }
+        }
+
+        let v_change = v_remove
+            .iter()
+            .chain(v_add.iter())
+            .copied()
+            .collect::<FnvHashSet<_>>();
+
+        // Simplexes to remove/add
+        let x_remove = v_add
+            .into_iter()
+            .map(|v| {
+                let mut vs = v_change
+                    .difference(&std::iter::once(v).collect())
+                    .copied()
+                    .collect::<Vec<_>>();
+                vs.sort();
+                vs
+            })
+            .collect::<Vec<_>>();
+        let x_add = v_remove
+            .into_iter()
+            .map(|v| {
+                let mut vs = v_change
+                    .difference(&std::iter::once(v).collect())
+                    .copied()
+                    .collect::<Vec<_>>();
+                vs.sort();
+                vs
+            })
+            .collect::<Vec<_>>();
+
+        match v_change.len() {
+            5 => {
+                // Tetrahedron replacement (general)
+                let x_remove = x_remove
+                    .into_iter()
+                    .map(|tet| self.tet_index([tet[0], tet[1], tet[2], tet[3]]))
+                    .collect::<Vec<_>>();
+
+                if x_remove.iter().any(|i| i.is_none()) {
+                    // Concave angle. Do not flip.
+                    return false;
+                }
+                for i in x_remove.into_iter().flatten() {
+                    self.remove_tet(i);
+                }
+                for tet in x_add {
+                    self.add_tet([tet[0], tet[1], tet[2], tet[3]]);
+                }
+            }
+
+            4 => {
+                // Triangle replacement (degenerate)
+            }
+
+            3 => {
+                // Line replacement (degenerate)
+            }
+
+            _ => panic!("Unexpected number of vertices involved: {}", v_change.len()),
+        }
+
+        true
+    }
+
+    /// Used only for testing.
+    /// Sorts *array* of tets lexicographically. (Not the same as sorting a tet)
+    fn canonicalize(&mut self) {
+        let mut sorted = self
+            .tets
+            .iter()
+            .map(|(i, tet)| (i, *tet))
+            .collect::<Vec<_>>();
+
+        sorted.sort_by_key(|(_, tet)| *tet);
+        let inv = sorted
+            .iter()
+            .enumerate()
+            .map(|(i, (j, _))| (*j, i))
+            .collect::<FnvHashMap<_, _>>();
+
+        for (_, (_, tets)) in self.vertices.iter_mut() {
+            *tets = tets.iter().map(|i| inv[i]).collect();
+        }
+
+        for (_, tets) in self.faces.iter_mut() {
+            *tets = tets.iter().map(|i| inv[i]).collect();
+        }
+
+        self.tets = sorted.into_iter().map(|(_, tet)| tet).collect();
     }
 }
 
@@ -448,6 +721,7 @@ mod test {
     use petgraph::algo;
     use petgraph::data::{Element, FromElements};
     use std::collections::BTreeSet;
+    use std::hash::Hash;
 
     fn create_graph<N, I, E>(
         vertices: Vec<N>,
@@ -557,10 +831,7 @@ mod test {
             vec3(1.0, 1.0, 1.0),
         ];
         let exp_tets = tetrahedrons(vec![[0, 1, 2, 3]]);
-        let tets = tetrahedrons(
-            DelaunayTetrahedralization::new(points)
-                .tetrahedrons().1
-        );
+        let tets = tetrahedrons(DelaunayTetrahedralization::new(points).tetrahedrons().1);
 
         assert_eq!(tets, exp_tets);
     }
@@ -576,10 +847,7 @@ mod test {
             vec3(1.0, 1.0, -2.0),
         ];
         let exp_tets = tetrahedrons(vec![[0, 1, 2, 3], [0, 1, 2, 4]]);
-        let tets = tetrahedrons(
-            DelaunayTetrahedralization::new(points)
-                .tetrahedrons().1
-        );
+        let tets = tetrahedrons(DelaunayTetrahedralization::new(points).tetrahedrons().1);
 
         assert_eq!(tets, exp_tets);
     }
@@ -595,10 +863,7 @@ mod test {
             vec3(1.0, 1.0, -0.5),
         ];
         let exp_tets = tetrahedrons(vec![[0, 1, 3, 4], [1, 2, 3, 4], [2, 0, 3, 4]]);
-        let tets = tetrahedrons(
-            DelaunayTetrahedralization::new(points)
-                .tetrahedrons().1
-        );
+        let tets = tetrahedrons(DelaunayTetrahedralization::new(points).tetrahedrons().1);
 
         assert_eq!(tets, exp_tets);
     }
@@ -638,4 +903,256 @@ mod test {
 
     //    dt.export_debug_obj("assets/debug/dt_test2.obj");
     //}
+
+    fn vertex_list<N: Copy, E>(graph: &Graph<N, E>) -> Vec<N> {
+        graph.node_indices().map(|n| graph[n]).collect()
+    }
+
+    fn edge_set<N, E: Copy + Eq + Hash>(
+        graph: &Graph<N, E>,
+    ) -> FnvHashSet<(NodeIndex, NodeIndex, E)> {
+        graph
+            .edge_references()
+            .map(|e| (e.source(), e.target(), *e.weight()))
+            .collect()
+    }
+
+    fn create_tets(
+        vertices: Vec<(Vec3, Vec<usize>)>,
+        faces: Vec<([usize; 3], Vec<usize>)>,
+        tets: Vec<[usize; 4]>,
+    ) -> Tetrahedralization {
+        let vertices = vertices
+            .into_iter()
+            .map(|(pos, tets)| (pos, tets.into_iter().collect()))
+            .collect();
+
+        let faces = faces
+            .into_iter()
+            .map(|(face, tets)| (face, tets.into_iter().collect()))
+            .collect();
+
+        let tets = tets.into_iter().collect();
+
+        Tetrahedralization {
+            vertices,
+            faces,
+            tets,
+        }
+    }
+
+    #[test]
+    fn test_tetrahedralization_init() {
+        let positions = vec![
+            vec3(0.0, 0.0, 0.0),
+            vec3(1.0, 0.0, 0.0),
+            vec3(0.0, 1.0, 0.0),
+            vec3(0.0, 0.0, 1.0),
+            vec3(1.0, 1.0, 1.0),
+        ];
+        let tets = vec![[0, 1, 2, 3], [4, 3, 2, 1]];
+        let tet = Tetrahedralization::new(positions, tets);
+
+        let exp = create_tets(
+            vec![
+                (vec3(0.0, 0.0, 0.0), vec![0]),
+                (vec3(1.0, 0.0, 0.0), vec![0, 1]),
+                (vec3(0.0, 1.0, 0.0), vec![0, 1]),
+                (vec3(0.0, 0.0, 1.0), vec![0, 1]),
+                (vec3(1.0, 1.0, 1.0), vec![1]),
+            ],
+            vec![
+                ([0, 1, 2], vec![0]),
+                ([0, 1, 3], vec![0]),
+                ([0, 2, 3], vec![0]),
+                ([1, 2, 3], vec![0, 1]),
+                ([1, 2, 4], vec![1]),
+                ([1, 3, 4], vec![1]),
+                ([2, 3, 4], vec![1]),
+            ],
+            vec![[0, 1, 2, 3], [1, 2, 3, 4]],
+        );
+
+        assert_eq!(tet.vertices, exp.vertices);
+        assert_eq!(tet.faces, exp.faces);
+        assert_eq!(tet.tets, exp.tets);
+    }
+
+    #[test]
+    fn test_tetrahedralization_tet_faces() {
+        assert_eq!(
+            Tetrahedralization::tet_faces([4, 5, 6, 7]).collect::<FnvHashSet<_>>(),
+            vec![[4, 5, 6], [4, 5, 7], [4, 6, 7], [5, 6, 7]]
+                .into_iter()
+                .collect::<FnvHashSet<_>>()
+        );
+    }
+
+    #[test]
+    fn test_tetrahedralization_face_edges() {
+        assert_eq!(
+            Tetrahedralization::face_edges([4, 5, 6]).collect::<FnvHashSet<_>>(),
+            vec![[4, 5], [4, 6], [5, 6]]
+                .into_iter()
+                .collect::<FnvHashSet<_>>()
+        );
+    }
+
+    #[test]
+    fn test_tetrahedralization_opposite_vertex_of_face() {
+        assert_eq!(
+            Tetrahedralization::opposite_vertex_of_face([4, 5, 6, 7], [4, 5, 6]),
+            7
+        );
+        assert_eq!(
+            Tetrahedralization::opposite_vertex_of_face([4, 5, 6, 7], [4, 5, 7]),
+            6
+        );
+        assert_eq!(
+            Tetrahedralization::opposite_vertex_of_face([4, 5, 6, 7], [4, 6, 7]),
+            5
+        );
+        assert_eq!(
+            Tetrahedralization::opposite_vertex_of_face([4, 5, 6, 7], [5, 6, 7]),
+            4
+        );
+    }
+
+    #[test]
+    fn test_tetrahedralization_opposite_vertex_of_edge() {
+        assert_eq!(
+            Tetrahedralization::opposite_vertex_of_edge([4, 5, 6], [4, 5]),
+            6
+        );
+        assert_eq!(
+            Tetrahedralization::opposite_vertex_of_edge([4, 5, 6], [4, 6]),
+            5
+        );
+        assert_eq!(
+            Tetrahedralization::opposite_vertex_of_edge([4, 5, 6], [5, 6]),
+            4
+        );
+    }
+
+    #[test]
+    fn test_tetrahedralization_edge_flex_convex() {
+        let positions = vec![
+            vec3(0.0, 1.0, 0.0),
+            vec3(-1.0, -1.0, 0.0),
+            vec3(1.0, -1.0, 0.0),
+            vec3(0.0, 0.0, -1.0),
+            vec3(0.0, 0.0, 1.0),
+        ];
+        let tets = vec![[0, 1, 2, 3], [0, 1, 2, 4]];
+        let tet = Tetrahedralization::new(positions, tets);
+
+        assert_eq!(tet.edge_flex([0, 1], 2, 3, 4), EdgeFlex::Convex);
+    }
+
+    #[test]
+    fn test_tetrahedralization_edge_flex_flat() {
+        let positions = vec![
+            vec3(0.0, 1.0, 0.0),
+            vec3(-1.0, -1.0, 0.0),
+            vec3(1.0, -1.0, 0.0),
+            vec3(0.0, 0.0, -1.0),
+            vec3(-1.0, 0.0, 1.0),
+        ];
+        let tets = vec![[0, 1, 2, 3], [0, 1, 2, 4]];
+        let tet = Tetrahedralization::new(positions, tets);
+
+        assert_eq!(tet.edge_flex([0, 1], 2, 3, 4), EdgeFlex::Flat);
+    }
+
+    #[test]
+    fn test_tetrahedralization_edge_flex_concave() {
+        let positions = vec![
+            vec3(0.0, 1.0, 0.0),
+            vec3(-1.0, -1.0, 0.0),
+            vec3(1.0, -1.0, 0.0),
+            vec3(0.0, 0.0, -1.0),
+            vec3(-2.0, 0.0, 1.0),
+        ];
+        let tets = vec![[0, 1, 2, 3], [0, 1, 2, 4]];
+        let tet = Tetrahedralization::new(positions, tets);
+
+        assert_eq!(tet.edge_flex([0, 1], 2, 3, 4), EdgeFlex::Concave);
+    }
+
+    #[test]
+    fn test_tetrahedralization_remove_face() {
+        let positions = vec![
+            vec3(0.0, 0.0, 0.0),
+            vec3(1.0, 0.0, 0.0),
+            vec3(0.0, 1.0, 0.0),
+            vec3(0.0, 0.0, 1.0),
+            vec3(1.0, 1.0, 1.0),
+        ];
+        let tets = vec![[0, 1, 2, 3], [4, 3, 2, 1]];
+        let mut tet = Tetrahedralization::new(positions, tets);
+        tet.remove_tet(0);
+        tet.canonicalize();
+
+        let exp = create_tets(
+            vec![
+                (vec3(0.0, 0.0, 0.0), vec![]),
+                (vec3(1.0, 0.0, 0.0), vec![0]),
+                (vec3(0.0, 1.0, 0.0), vec![0]),
+                (vec3(0.0, 0.0, 1.0), vec![0]),
+                (vec3(1.0, 1.0, 1.0), vec![0]),
+            ],
+            vec![
+                ([1, 2, 3], vec![0]),
+                ([1, 2, 4], vec![0]),
+                ([1, 3, 4], vec![0]),
+                ([2, 3, 4], vec![0]),
+            ],
+            vec![[1, 2, 3, 4]],
+        );
+
+        assert_eq!(tet.vertices, exp.vertices);
+        assert_eq!(tet.faces, exp.faces);
+        assert_eq!(tet.tets, exp.tets);
+    }
+
+    #[test]
+    fn test_tetrahedralization_add_face() {
+        let positions = vec![
+            vec3(0.0, 0.0, 0.0),
+            vec3(1.0, 0.0, 0.0),
+            vec3(0.0, 1.0, 0.0),
+            vec3(0.0, 0.0, 1.0),
+            vec3(1.0, 1.0, 1.0),
+        ];
+        let tets = vec![[0, 1, 2, 4], [0, 2, 3, 4]];
+        let mut tet = Tetrahedralization::new(positions, tets);
+        tet.add_tet([0, 1, 3, 4]);
+        tet.canonicalize();
+
+        let exp = create_tets(
+            vec![
+                (vec3(0.0, 0.0, 0.0), vec![0, 1, 2]),
+                (vec3(1.0, 0.0, 0.0), vec![0, 1]),
+                (vec3(0.0, 1.0, 0.0), vec![0, 2]),
+                (vec3(0.0, 0.0, 1.0), vec![1, 2]),
+                (vec3(1.0, 1.0, 1.0), vec![0, 1, 2]),
+            ],
+            vec![
+                ([0, 1, 2], vec![0]),
+                ([0, 1, 3], vec![1]),
+                ([0, 1, 4], vec![0, 1]),
+                ([0, 2, 3], vec![2]),
+                ([0, 2, 4], vec![0, 2]),
+                ([0, 3, 4], vec![1, 2]),
+                ([1, 2, 4], vec![0]),
+                ([1, 3, 4], vec![1]),
+                ([2, 3, 4], vec![2]),
+            ],
+            vec![[0, 1, 2, 4], [0, 1, 3, 4], [0, 2, 3, 4]],
+        );
+
+        assert_eq!(tet.vertices, exp.vertices);
+        assert_eq!(tet.faces, exp.faces);
+        assert_eq!(tet.tets, exp.tets);
+    }
 }

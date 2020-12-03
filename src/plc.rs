@@ -1,11 +1,11 @@
+use fnv::{FnvHashMap, FnvHashSet};
 use petgraph::prelude::*;
 use petgraph::unionfind::UnionFind;
 use tri_mesh::prelude::*;
-use fnv::{FnvHashMap, FnvHashSet};
 
-use crate::util::GraphEx;
-use crate::material_mesh::{MaterialMesh, MaterialID};
+use crate::material_mesh::{MaterialID, MaterialMesh};
 use crate::tetrahedralize::DelaunayTetrahedralization;
+use crate::util::GraphEx;
 
 /// Vertices are nodes weighted by positions.
 /// Faces are collections directed edges weighted by the same face ID.
@@ -23,10 +23,10 @@ impl PiecewiseLinearComplex {
     /// from a hopefully manifold tri-mesh.
     pub fn new(mesh: MaterialMesh) -> Self {
         let mesh = mesh.mesh();
-        let vertices = mesh.vertex_iter()
-            .map(|v| mesh.vertex_position(v));
+        let vertices = mesh.vertex_iter().map(|v| mesh.vertex_position(v));
 
-        let faces = mesh.face_iter()
+        let faces = mesh
+            .face_iter()
             .map(|f| (mesh.face_vertices(f), mesh.face_normal(f), mesh.face_tag(f)));
 
         let mut graph = Graph::new();
@@ -70,8 +70,8 @@ impl PiecewiseLinearComplex {
                     let f1 = self.mesh[edge];
                     let f2 = self.mesh[opposite];
 
-                    if self.materials[f1] == self.materials[f2] &&
-                        (self.normals[f1] - self.normals[f2]).magnitude() < Self::EPSILON
+                    if self.materials[f1] == self.materials[f2]
+                        && (self.normals[f1] - self.normals[f2]).magnitude() < Self::EPSILON
                     {
                         self.mesh.remove_edge(edge);
                         self.mesh.remove_edge(opposite);
@@ -93,22 +93,27 @@ impl PiecewiseLinearComplex {
     }
 
     fn tetrahedralize_vertices(&mut self) -> DelaunayTetrahedralization {
-        DelaunayTetrahedralization::new(
-            self.mesh.node_weights_mut().map(|pos| *pos).collect()
-        )
+        DelaunayTetrahedralization::new(self.mesh.node_weights_mut().map(|pos| *pos).collect())
     }
 
     fn recover_edges(&mut self, dt: &mut DelaunayTetrahedralization) {
         // Just subdivide each missing edge until it exists in the DT.
         // Edges here are undirected and thus their vertices are sorted by index.
-        let mut edges = self.mesh.edge_references()
+        let mut edges = self
+            .mesh
+            .edge_references()
             .map(|e| {
                 let (s, t) = (e.source().index(), e.target().index());
-                if s < t { (s, t) } else { (t, s) }
+                if s < t {
+                    (s, t)
+                } else {
+                    (t, s)
+                }
             })
             .collect::<FnvHashSet<_>>();
 
-        let mut missing = edges.difference(&dt.tetrahedron_edges().collect())
+        let mut missing = edges
+            .difference(&dt.tetrahedron_edges().collect())
             .copied()
             .collect::<FnvHashSet<_>>();
 
@@ -202,18 +207,36 @@ mod test {
             vec![1, 0, 2, 2, 0, 3, 3, 0, 1, 1, 2, 3],
         );
         let graph = create_graph(
-            vec![vec3(0.0, 0.0, 0.0), vec3(1.0, 0.0, 0.0), vec3(0.0, 1.0, 0.0), vec3(0.0, 0.0, 1.0)],
             vec![
-                (1, 0, 0), (0, 2, 0), (2, 1, 0),
-                (2, 0, 1), (0, 3, 1), (3, 2, 1),
-                (3, 0, 2), (0, 1, 2), (1, 3, 2),
-                (1, 2, 3), (2, 3, 3), (3, 1, 3)
+                vec3(0.0, 0.0, 0.0),
+                vec3(1.0, 0.0, 0.0),
+                vec3(0.0, 1.0, 0.0),
+                vec3(0.0, 0.0, 1.0),
             ],
-            |x| x
+            vec![
+                (1, 0, 0),
+                (0, 2, 0),
+                (2, 1, 0),
+                (2, 0, 1),
+                (0, 3, 1),
+                (3, 2, 1),
+                (3, 0, 2),
+                (0, 1, 2),
+                (1, 3, 2),
+                (1, 2, 3),
+                (2, 3, 3),
+                (3, 1, 3),
+            ],
+            |x| x,
         );
         let plc = PiecewiseLinearComplex::new(mesh);
 
-        assert!(algo::is_isomorphic_matching(&plc.mesh, &graph, |x, y| x == y, |x, y| x == y));
+        assert!(algo::is_isomorphic_matching(
+            &plc.mesh,
+            &graph,
+            |x, y| x == y,
+            |x, y| x == y
+        ));
         assert_eq!(plc.normals.len(), 4);
         assert_eq!(plc.materials, vec![MaterialID::default(); 4]);
     }
@@ -237,9 +260,29 @@ mod test {
     #[ignore = "manual"]
     fn test_schonhardt_edges() {
         let mesh = create_mesh(
-            vec![1.0, 0.0, 0.0, -0.5, 0.0, -0.75f64.sqrt(), -0.5, 0.0, 0.75f64.sqrt(),
-                          0.75f64.sqrt(), 1.5, -0.5, -0.75f64.sqrt(), 1.5, -0.5, 0.0, 1.5, 1.0],
-            vec![2, 1, 0, 2, 0, 3, 3, 5, 2, 0, 1, 4, 4, 3, 0, 1, 2, 5, 5, 4, 1, 3, 4, 5]
+            vec![
+                1.0,
+                0.0,
+                0.0,
+                -0.5,
+                0.0,
+                -0.75f64.sqrt(),
+                -0.5,
+                0.0,
+                0.75f64.sqrt(),
+                0.75f64.sqrt(),
+                1.5,
+                -0.5,
+                -0.75f64.sqrt(),
+                1.5,
+                -0.5,
+                0.0,
+                1.5,
+                1.0,
+            ],
+            vec![
+                2, 1, 0, 2, 0, 3, 3, 5, 2, 0, 1, 4, 4, 3, 0, 1, 2, 5, 5, 4, 1, 3, 4, 5,
+            ],
         );
         let mut plc = PiecewiseLinearComplex::new(mesh);
         let mut dt = plc.tetrahedralize_vertices();
