@@ -5,6 +5,8 @@ use stable_vec::StableVec;
 use std::path::Path;
 use tri_mesh::prelude::*;
 
+use crate::util::ArrayEx;
+
 /// A tetrahedralization of a bunch of points.
 /// Uses Bowyer's algorithm
 #[derive(Clone, Debug)]
@@ -417,7 +419,7 @@ impl DelaunayTetrahedralization {
 
 /// A tetrahedralization that isn't necessarily Delaunay.
 #[derive(Clone, Debug, PartialEq)]
-struct Tetrahedralization {
+pub struct Tetrahedralization {
     /// Vertex positions and adjacent tetrahedrons. Tet vertices are sorted.
     vertices: StableVec<(Vec3, FnvHashSet<usize>)>,
     /// Faces and adjacent tetrahedrons, for convenience. Face and tet vertices are sorted.
@@ -825,6 +827,190 @@ impl Tetrahedralization {
         }
 
         true
+    }
+
+    fn find_first_intersecting_edge(
+        &self,
+        edges: &[[usize; 2]],
+        normal: Vec3,
+        vertex_set: &FnvHashSet<usize>,
+    ) -> (
+        Vec<[usize; 2]>,
+        FnvHashSet<[usize; 3]>,
+        FnvHashSet<usize>,
+        Vec3,
+        FnvHashSet<[usize; 2]>,
+    ) {
+        let mut edges_to_search = vec![];
+        let mut inner_faces = FnvHashSet::default();
+        let mut inner_tets = FnvHashSet::default();
+        let mut point = vec3(0.0, 0.0, 0.0);
+        let mut face_edges = FnvHashSet::default();
+
+        'edge_loop: for edge in edges {
+            let c_edge = edge.sorted();
+
+            for (index, tet) in self.edge_tet_indexes_and_tets(c_edge) {
+                let oppose = Self::opposite_edge_of_edge(tet, c_edge);
+
+                point = self.vertices[edge[0]].0;
+                let e_pos = self.vertices[edge[1]].0 - point;
+                let o0_pos = self.vertices[oppose[0]].0 - point;
+                let o1_pos = self.vertices[oppose[1]].0 - point;
+
+                // Check if tet is "inside" face
+
+                // Obtain tet edge normal
+                let mut tet_normal =
+                    e_pos.cross(o0_pos).normalize() + o1_pos.cross(e_pos).normalize();
+                if tet_normal.dot(o1_pos) > 0.0 {
+                    tet_normal *= -1.0;
+                }
+
+                // Obtain plc face edge normal
+                let edge_normal = e_pos.cross(normal);
+                if tet_normal.dot(edge_normal) > 0.0 {
+                    // Tet is "inside"
+                    // Check if tetrahedron at least partially triangulates face
+                    for v in &oppose {
+                        if vertex_set.contains(v) {
+                            face_edges = vec![*edge, [edge[1], *v], [*v, edge[0]]]
+                                .into_iter()
+                                .collect();
+                            break 'edge_loop;
+                        }
+                    }
+
+                    // Check if tetrahedron overlaps face
+                    if (normal.dot(o0_pos) >= 0.0) != (normal.dot(o1_pos) >= 0.0) {
+                        edges_to_search.push([oppose[0], oppose[1]].sorted());
+                        inner_tets.insert(index);
+                        inner_faces.insert([oppose[0], oppose[1], edge[0]].sorted());
+                        inner_faces.insert([oppose[0], oppose[1], edge[1]].sorted());
+                        face_edges.insert(*edge);
+                        break 'edge_loop;
+                    }
+                }
+            }
+        }
+
+        (edges_to_search, inner_faces, inner_tets, point, face_edges)
+    }
+
+    fn find_all_intersecting_faces(
+        &self,
+        normal: Vec3,
+        edges_to_search: &mut Vec<[usize; 2]>,
+        inner_faces: &mut FnvHashSet<[usize; 3]>,
+        inner_tets: &mut FnvHashSet<usize>,
+        point: Vec3,
+        face_edges: &mut FnvHashSet<[usize; 2]>,
+        vertex_set: &FnvHashSet<usize>,
+    ) {
+        // Find the rest of the inner tets.
+        // This edge is sorted.
+        while let Some(edge) = edges_to_search.pop() {
+            // This edge intersects the face. Add every tetrahedron around the edge.
+            for (index, tet) in self.edge_tet_indexes_and_tets(edge) {
+                if !inner_tets.insert(index) {
+                    continue; // already visited
+                }
+
+                let oppose = Self::opposite_edge_of_edge(tet, edge);
+                inner_faces.insert([edge[0], edge[1], oppose[0]].sorted());
+                inner_faces.insert([edge[0], edge[1], oppose[1]].sorted());
+
+                let e0_pos = self.vertices[edge[0]].0 - point;
+                let e1_pos = self.vertices[edge[1]].0 - point;
+                let o0_pos = self.vertices[oppose[0]].0 - point;
+                let o1_pos = self.vertices[oppose[1]].0 - point;
+
+                if vertex_set.contains(&oppose[0]) && vertex_set.contains(&oppose[1]) {
+                    // Contains edge of face (or triangulation edge)
+                    let mut tet_normal = (o1_pos - o0_pos).cross(e0_pos - o0_pos).normalize()
+                        + (e1_pos - o0_pos).cross(o1_pos - o0_pos).normalize();
+                    if tet_normal.dot(e1_pos - o0_pos) > 0.0 {
+                        tet_normal *= -1.0;
+                    }
+                    let edge_dir = normal.cross(tet_normal);
+                    face_edges.insert(if edge_dir.dot(o1_pos - o0_pos) >= 0.0 {
+                        [oppose[0], oppose[1]]
+                    } else {
+                        [oppose[1], oppose[0]]
+                    });
+                } else if vertex_set.contains(&oppose[0]) || vertex_set.contains(&oppose[1]) {
+                    // Contains vertex of face
+                    let i = if vertex_set.contains(&oppose[0]) {
+                        1
+                    } else {
+                        0
+                    };
+                    let other = if (normal.dot(if i == 0 { o0_pos } else { o1_pos }) >= 0.0)
+                        == (normal.dot(e0_pos) >= 0.0)
+                    {
+                        edge[1]
+                    } else {
+                        edge[0]
+                    };
+                    edges_to_search.push([oppose[i], other].sorted());
+                } else if (normal.dot(o0_pos) >= 0.0) == (normal.dot(o1_pos) >= 0.0) {
+                    // Opposite edge intersects face
+                    let other_index = if (normal.dot(o0_pos) >= 0.0) == (normal.dot(e0_pos) >= 0.0)
+                    {
+                        1
+                    } else {
+                        0
+                    };
+                    edges_to_search.push(oppose);
+                    edges_to_search.push([oppose[0], edge[other_index]].sorted());
+                    edges_to_search.push([oppose[1], edge[1 - other_index]].sorted());
+                } else {
+                    // Opposite edge is on one side of face
+                    let other = if (normal.dot(o0_pos) >= 0.0) == (normal.dot(e0_pos) >= 0.0) {
+                        edge[1]
+                    } else {
+                        edge[0]
+                    };
+                    edges_to_search.push([oppose[0], other].sorted());
+                    edges_to_search.push([oppose[1], other].sorted());
+                }
+            }
+        }
+    }
+
+    /// Recovers a PLC face enclosed by certain edges with a certain normal.
+    /// The edges here are NOT sorted. They wind counterclockwise around the face if the normal points up.
+    /// Output is the face that actually got recovered, which may be smaller because
+    /// the face may already be split by the tetrahedralization.
+    /// Uses Shewchuk's algorithm.
+    pub fn recover_plc_face(
+        &mut self,
+        edges: &[[usize; 2]],
+        normal: Vec3,
+    ) -> FnvHashSet<[usize; 2]> {
+        let vertex_set = edges
+            .iter()
+            .flat_map(|[e1, e2]| vec![*e1, *e2].into_iter())
+            .collect::<FnvHashSet<_>>();
+
+        let (mut edges_to_search, mut inner_faces, mut inner_tets, point, mut face_edges) =
+            self.find_first_intersecting_edge(edges, normal, &vertex_set);
+        if face_edges.len() > 1 {
+            // Found a triangle on the face
+            return face_edges;
+        }
+
+        self.find_all_intersecting_faces(
+            normal,
+            &mut edges_to_search,
+            &mut inner_faces,
+            &mut inner_tets,
+            point,
+            &mut face_edges,
+            &vertex_set,
+        );
+
+        todo!()
     }
 
     /// Used only for testing.
@@ -1518,5 +1704,259 @@ mod test {
         let clone = tet.clone();
         assert!(!tet.flip([0, 1, 2]));
         assert_eq!(tet, clone);
+    }
+
+    #[test]
+    fn test_tetrahedralization_find_first_intersecting_edge() {
+        let positions = vec![
+            vec3(0.0, 1.0, 0.0),
+            vec3(-1.0, -1.0, 0.0),
+            vec3(1.0, -1.0, 0.0),
+            vec3(0.0, 0.0, -1.0),
+            vec3(0.0, 0.0, 1.0),
+        ];
+        let tets = vec![[0, 1, 3, 4], [1, 2, 3, 4], [0, 2, 3, 4]];
+        let tet = Tetrahedralization::new(positions.clone(), tets);
+        let (edges_to_search, inner_faces, inner_tets, point, face_edges) = tet
+            .find_first_intersecting_edge(
+                &[[0, 1], [1, 2], [2, 0]],
+                Vec3::unit_z(),
+                &(0..3).collect(),
+            );
+
+        assert_eq!(edges_to_search, vec![[3, 4]]);
+        assert_eq!(
+            inner_faces,
+            vec![[0, 3, 4], [1, 3, 4]].into_iter().collect()
+        );
+        assert_eq!(inner_tets, vec![0].into_iter().collect());
+        assert_eq!(point, vec3(0.0, 1.0, 0.0));
+        assert_eq!(face_edges, vec![[0, 1]].into_iter().collect());
+    }
+
+    #[test]
+    fn test_tetrahedralization_find_first_intersecting_edge_2() {
+        let positions = vec![
+            vec3(0.0, 1.0, 0.0),
+            vec3(-1.0, -1.0, 0.0),
+            vec3(1.0, -1.0, 0.0),
+            vec3(0.0, 0.0, -1.0),
+            vec3(0.0, 0.0, 1.0),
+        ];
+        let tets = vec![[0, 1, 2, 3], [0, 1, 2, 4]];
+        let tet = Tetrahedralization::new(positions.clone(), tets);
+        let (edges_to_search, inner_faces, inner_tets, point, face_edges) = tet
+            .find_first_intersecting_edge(
+                &[[0, 1], [1, 2], [2, 0]],
+                Vec3::unit_z(),
+                &(0..3).collect(),
+            );
+
+        assert_eq!(
+            face_edges,
+            vec![[0, 1], [1, 2], [2, 0]].into_iter().collect()
+        );
+    }
+
+    #[test]
+    fn test_tetrahedralization_find_first_intersecting_edge_bigger() {
+        let positions = vec![
+            vec3(0.0, 0.0, 0.0),
+            vec3(3.0, 0.0, 0.0),
+            vec3(3.0, 3.0, 0.0),
+            vec3(0.0, 3.0, 0.0),
+            vec3(1.0, 1.0, -1.0),
+            vec3(2.0, 2.0, -1.0),
+            vec3(1.0, 1.0, 1.0),
+            vec3(2.0, 2.0, 1.0),
+        ];
+        let tets = vec![
+            [0, 1, 4, 6],
+            [0, 3, 4, 6],
+            [1, 3, 4, 6],
+            [1, 3, 4, 5],
+            [1, 3, 6, 7],
+            [1, 2, 5, 7],
+            [1, 3, 5, 7],
+            [2, 3, 5, 7],
+        ];
+        let tet = Tetrahedralization::new(positions.clone(), tets);
+        let (edges_to_search, inner_faces, inner_tets, point, face_edges) = tet
+            .find_first_intersecting_edge(
+                &[[0, 1], [1, 2], [2, 3], [3, 0]],
+                Vec3::unit_z(),
+                &(0..4).collect(),
+            );
+
+        assert_eq!(edges_to_search, vec![[4, 6]]);
+        assert_eq!(
+            inner_faces,
+            vec![[0, 4, 6], [1, 4, 6]].into_iter().collect()
+        );
+        assert_eq!(inner_tets, vec![0].into_iter().collect());
+        assert_eq!(point, vec3(0.0, 0.0, 0.0));
+        assert_eq!(face_edges, vec![[0, 1]].into_iter().collect());
+    }
+
+    #[test]
+    fn test_tetrahedralization_find_all_intersecting_faces() {
+        let positions = vec![
+            vec3(0.0, 1.0, 0.0),
+            vec3(-1.0, -1.0, 0.0),
+            vec3(1.0, -1.0, 0.0),
+            vec3(0.0, 0.0, -1.0),
+            vec3(0.0, 0.0, 1.0),
+        ];
+        let tets = vec![[0, 1, 3, 4], [1, 2, 3, 4], [0, 2, 3, 4]];
+        let tet = Tetrahedralization::new(positions.clone(), tets);
+        let (mut edges_to_search, mut inner_faces, mut inner_tets, point, mut face_edges) = tet
+            .find_first_intersecting_edge(
+                &[[0, 1], [1, 2], [2, 0]],
+                Vec3::unit_z(),
+                &(0..3).collect(),
+            );
+        tet.find_all_intersecting_faces(
+            Vec3::unit_z(),
+            &mut edges_to_search,
+            &mut inner_faces,
+            &mut inner_tets,
+            point,
+            &mut face_edges,
+            &(0..3).collect(),
+        );
+
+        assert_eq!(edges_to_search, vec![] as Vec<[usize; 2]>);
+        assert_eq!(
+            inner_faces,
+            vec![[0, 3, 4], [1, 3, 4], [2, 3, 4]].into_iter().collect()
+        );
+        assert_eq!(inner_tets, vec![0, 1, 2].into_iter().collect());
+        assert_eq!(point, vec3(0.0, 1.0, 0.0));
+        assert_eq!(
+            face_edges,
+            vec![[0, 1], [1, 2], [2, 0]].into_iter().collect()
+        );
+    }
+
+    #[test]
+    fn test_tetrahedralization_find_all_intersecting_faces_bigger() {
+        let positions = vec![
+            vec3(0.0, 0.0, 0.0),
+            vec3(3.0, 0.0, 0.0),
+            vec3(3.0, 3.0, 0.0),
+            vec3(0.0, 3.0, 0.0),
+            vec3(1.0, 1.0, -1.0),
+            vec3(2.0, 2.0, -1.0),
+            vec3(1.0, 1.0, 1.0),
+            vec3(2.0, 2.0, 1.0),
+        ];
+        let tets = vec![
+            [0, 1, 4, 6],
+            [0, 3, 4, 6],
+            [1, 3, 4, 6],
+            [1, 3, 4, 5],
+            [1, 3, 6, 7],
+            [1, 2, 5, 7],
+            [1, 3, 5, 7],
+            [2, 3, 5, 7],
+        ];
+        let tet = Tetrahedralization::new(positions.clone(), tets);
+        let (mut edges_to_search, mut inner_faces, mut inner_tets, point, mut face_edges) = tet
+            .find_first_intersecting_edge(
+                &[[0, 1], [1, 2], [2, 3], [3, 0]],
+                Vec3::unit_z(),
+                &(0..4).collect(),
+            );
+        tet.find_all_intersecting_faces(
+            Vec3::unit_z(),
+            &mut edges_to_search,
+            &mut inner_faces,
+            &mut inner_tets,
+            point,
+            &mut face_edges,
+            &(0..4).collect(),
+        );
+
+        assert_eq!(edges_to_search, vec![] as Vec<[usize; 2]>);
+        assert_eq!(
+            inner_faces,
+            vec![[0, 4, 6], [1, 4, 6], [3, 4, 6]].into_iter().collect()
+        );
+        assert_eq!(inner_tets, vec![0, 1, 2].into_iter().collect());
+        assert_eq!(point, vec3(0.0, 0.0, 0.0));
+        assert_eq!(
+            face_edges,
+            vec![[0, 1], [1, 3], [3, 0]].into_iter().collect()
+        );
+    }
+
+    #[test]
+    fn test_tetrahedralization_find_all_intersecting_faces_one_vertex_case() {
+        let positions = vec![
+            vec3(0.0, 0.0, 0.0),
+            vec3(3.0, 0.0, 0.0),
+            vec3(3.0, 3.0, 0.0),
+            vec3(0.0, 3.0, 0.0),
+            vec3(1.0, 1.0, -1.0),
+            vec3(2.0, 2.0, -1.0),
+            vec3(1.0, 1.0, 1.0),
+            vec3(2.0, 2.0, 1.0),
+            vec3(1.5, 1.5, 2.0),
+        ];
+        let tets = vec![
+            [0, 1, 4, 6],
+            [0, 3, 4, 6],
+            [3, 4, 5, 6],
+            [3, 5, 6, 7],
+            [1, 4, 5, 6],
+            [1, 5, 6, 7],
+            [1, 2, 5, 7],
+            [2, 3, 5, 7],
+            [3, 6, 7, 8],
+        ];
+        let tet = Tetrahedralization::new(positions.clone(), tets);
+        let (mut edges_to_search, mut inner_faces, mut inner_tets, point, mut face_edges) = tet
+            .find_first_intersecting_edge(
+                &[[0, 1], [1, 2], [2, 3], [3, 0]],
+                Vec3::unit_z(),
+                &(0..4).collect(),
+            );
+        tet.find_all_intersecting_faces(
+            Vec3::unit_z(),
+            &mut edges_to_search,
+            &mut inner_faces,
+            &mut inner_tets,
+            point,
+            &mut face_edges,
+            &(0..4).collect(),
+        );
+
+        assert_eq!(edges_to_search, vec![] as Vec<[usize; 2]>);
+        assert_eq!(
+            inner_faces,
+            vec![
+                [0, 4, 6],
+                [1, 4, 6],
+                [3, 4, 6],
+                [4, 5, 6],
+                [5, 6, 7],
+                [1, 5, 7],
+                [2, 5, 7],
+                [3, 5, 7],
+                [1, 5, 6],
+                [3, 5, 6]
+            ]
+            .into_iter()
+            .collect()
+        );
+        assert_eq!(
+            inner_tets,
+            vec![0, 1, 2, 3, 4, 5, 6, 7].into_iter().collect()
+        );
+        assert_eq!(point, vec3(0.0, 0.0, 0.0));
+        assert_eq!(
+            face_edges,
+            vec![[0, 1], [1, 2], [2, 3], [3, 0]].into_iter().collect()
+        );
     }
 }

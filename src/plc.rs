@@ -4,7 +4,7 @@ use petgraph::unionfind::UnionFind;
 use tri_mesh::prelude::*;
 
 use crate::material_mesh::{MaterialID, MaterialMesh};
-use crate::tetrahedralize::DelaunayTetrahedralization;
+use crate::tetrahedralize::{DelaunayTetrahedralization, Tetrahedralization};
 use crate::util::GraphEx;
 
 /// Vertices are nodes weighted by positions.
@@ -162,6 +162,8 @@ impl PiecewiseLinearComplex {
         self.recover_edges(&mut dt);
 
         // Recover faces
+        let (vertices, tets) = dt.tetrahedrons();
+        let tets = Tetrahedralization::new(vertices, tets);
 
         todo!()
     }

@@ -89,3 +89,22 @@ impl<N, E> GraphEx for Graph<N, E> {
         self.edges_directed(node, Direction::Incoming)
     }
 }
+
+pub trait ArrayEx {
+    fn sorted(self) -> Self;
+}
+
+macro_rules! impl_array_ex {
+    ($n:expr) => {
+        impl<T: Ord> ArrayEx for [T; $n] {
+            fn sorted(mut self) -> Self {
+                self.sort();
+                self
+            }
+        }
+    };
+}
+
+impl_array_ex!(2);
+impl_array_ex!(3);
+impl_array_ex!(4);
