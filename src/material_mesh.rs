@@ -8,14 +8,18 @@ use std::num::NonZeroU32;
 use std::path::Path;
 use tri_mesh::mesh_builder;
 use tri_mesh::prelude::*;
+use bvh::bvh::BVH;
+use bvh::nalgebra::Point3 as NPoint3;
+use bvh::aabb::{AABB, Bounded};
+use bvh::bounding_hierarchy::{BoundingHierarchy, BHShape};
 
 use crate::triangulate::Polygon;
 use crate::util::{GraphEx, HashVec2, HashVec3, Vec2};
 
 /// The ID type for a material
 /// 0 is reserved for the absence of a material
-#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
-pub struct MaterialID(NonZeroU32);
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash, Ord, PartialOrd)]
+pub struct MaterialID(pub NonZeroU32);
 
 impl Default for MaterialID {
     fn default() -> Self {
@@ -68,9 +72,15 @@ impl MaterialMesh {
         &self.mesh
     }
 
-    pub fn export_debug_obj<P: AsRef<Path>>(&self, path: P) {
-        let obj = self.mesh.parse_as_obj();
-        fs::write(path, obj).expect("Could not debug obj");
+    pub fn mesh_mut(&mut self) -> &mut Mesh<MaterialID> {
+        &mut self.mesh
+    }
+
+    pub fn export_debug_obj<P: AsRef<Path> + Clone>(&self, path: P) {
+        let (obj, mtl) = self.mesh.parse_as_obj_multimaterial(|mat| mat.0.get() as usize - 1);
+        fs::write(path.clone(), obj).expect("Could not debug obj");
+        let path = path.as_ref();
+        fs::write(path.with_extension("mtl"), mtl).expect("Could not debug mtl");
     }
 
     pub fn debug_vertices_faces(&self) {
@@ -88,6 +98,14 @@ impl MaterialMesh {
         let mesh = MeshBuilder::new()
             .with_obj(source)
             .with_default_tag(MaterialID::new(1))
+            .build()?;
+
+        Ok(Self { mesh })
+    }
+
+    pub fn from_obj_multi_material(source: String) -> Result<Self, mesh_builder::Error> {
+        let mesh = MeshBuilder::new()
+            .with_obj_multimaterial(source, |i| MaterialID::new(i as u32 + 1))
             .build()?;
 
         Ok(Self { mesh })
@@ -585,9 +603,26 @@ impl MaterialMesh {
             let mut pos = self.mesh.vertex_position(vertex_id);
             let slice_plane = (pos[axis as usize] / spacing).round() * spacing;
 
-            if (slice_plane - pos[axis as usize]).abs() < Self::EPSILON {
+            // Bigger epsilon here to mask tet face recovery bug
+            if (slice_plane - pos[axis as usize]).abs() < 0.001 {
                 pos[axis as usize] = slice_plane;
                 self.mesh.move_vertex_to(vertex_id, pos);
+            }
+        }
+    }
+
+    pub fn collapse_small_edges(&mut self) {
+        let edges = self.mesh.edge_iter().map(|e| self.mesh.edge_vertices(e)).collect::<Vec<_>>();
+        let mut deleted = FnvHashSet::default();
+
+        for (v0, v1) in edges {
+            if !deleted.contains(&v0) && !deleted.contains(&v1) {
+                if let Some(edge) = self.mesh.connecting_edge(v0, v1) {
+                    if self.mesh.edge_sqr_length(edge) < 0.001f64.powi(2) {
+                        let surviving = self.mesh.collapse_edge(edge);
+                        deleted.insert(if surviving == v0 { v1 } else { v0 });
+                    }
+                }
             }
         }
     }
@@ -1106,6 +1141,22 @@ impl MaterialMesh {
                 .expect("Invalid mesh"),
         )
     }
+
+    /// Builds a BVH from the triangles.
+    pub fn bvh(&self) -> (BVH, Vec<BvhTriangle>) {
+        let mut triangles = self.mesh.face_iter().map(|f| {
+            let (p0, p1, p2) = self.mesh.face_positions(f);
+
+            BvhTriangle {
+                points: [p0, p1, p2],
+                material: self.mesh.face_tag(f),
+                node_index: 0
+            }
+        }).collect::<Vec<_>>();
+
+        let bvh = BVH::build(&mut triangles);
+        (bvh, triangles)
+    }
 }
 
 struct Interval {
@@ -1126,6 +1177,78 @@ impl Axis {
         let mut vec = Vec3::zero();
         vec[self as usize] = 1.0;
         vec
+    }
+}
+
+/// A triangle used in a BVH
+#[derive(Clone, Debug)]
+pub struct BvhTriangle {
+    points: [Vec3; 3],
+    material: MaterialID,
+    node_index: usize,
+}
+
+impl BvhTriangle {
+    pub fn material(&self) -> MaterialID {
+        self.material
+    }
+
+    /// Finds the time of intersection between this triangle
+    /// and a ray from point in direction dir.
+    /// The time is the value t such that point + t * dir = point of intersection
+    /// Returns None if no intersection.
+    pub fn intersection_time(&self, point: Vec3, dir: Vec3) -> Option<f64> {
+        let base = self.points[0];
+        let p1 = self.points[1] - base;
+        let p2 = self.points[2] - base;
+        let p = point - base;
+
+        // Ray should move toward triangle's plane
+        let normal = p1.cross(p2); // not normalized
+        if normal.dot(p) * normal.dot(dir) >= 0.0 {
+            None?;
+        }
+
+        let normal = normal.normalize(); // now normalized
+        let t = normal.dot(-p) / normal.dot(dir);
+        let intersect = p + t * dir;
+
+        // Check that intersection is in triangle
+        let mtx = Mat3::from_cols(normal, p1 + normal, p2 + normal);
+        let barycentric = mtx.invert()? * (intersect + normal);
+
+        if barycentric.x > -MaterialMesh::EPSILON && barycentric.y > -MaterialMesh::EPSILON && barycentric.z > -MaterialMesh::EPSILON {
+            Some(t)
+        } else {
+            None
+        }
+    }
+}
+
+impl Bounded for BvhTriangle {
+    fn aabb(&self) -> AABB {
+        let min = NPoint3::new(
+            self.points[0].x.min(self.points[1].x).min(self.points[2].x) as f32,
+            self.points[0].y.min(self.points[1].y).min(self.points[2].y) as f32,
+            self.points[0].z.min(self.points[1].z).min(self.points[2].z) as f32,
+        );
+        let max = NPoint3::new(
+            self.points[0].x.max(self.points[1].x).max(self.points[2].x) as f32,
+            self.points[0].y.max(self.points[1].y).max(self.points[2].y) as f32,
+            self.points[0].z.max(self.points[1].z).max(self.points[2].z) as f32,
+        );
+
+        AABB::with_bounds(min, max)
+    }
+}
+
+impl BHShape for BvhTriangle {
+    fn set_bh_node_index(&mut self, index: usize) {
+        self.node_index = index;
+    }
+
+    fn bh_node_index(&self) -> usize {
+        self.node_index
     }
 }
 

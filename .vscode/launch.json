@@ -26,6 +26,29 @@
         {
             "type": "lldb",
             "request": "launch",
+            "name": "Debug test_custom",
+            "cargo": {
+                "args": [
+                    "test",
+                    "--no-run",
+                    "--lib",
+                    "--package=voxelization"
+                ],
+                "filter": {
+                    "name": "voxelization",
+                    "kind": "lib"
+                }
+            },
+            "args": [
+                "plc::test::test_custom",
+                "--nocapture",
+                "--ignored",
+            ],
+            "cwd": "${workspaceFolder}"
+        },
+        {
+            "type": "lldb",
+            "request": "launch",
             "name": "Debug executable 'voxelization'",
             "cargo": {
                 "args": [

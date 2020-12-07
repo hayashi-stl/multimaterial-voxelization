@@ -2,9 +2,10 @@ use fnv::{FnvHashMap, FnvHashSet};
 use petgraph::prelude::*;
 use petgraph::unionfind::UnionFind;
 use tri_mesh::prelude::*;
+use std::path::Path;
 
 use crate::material_mesh::{MaterialID, MaterialMesh};
-use crate::tetrahedralize::{DelaunayTetrahedralization, Tetrahedralization};
+use crate::tetrahedralize::{DelaunayTetrahedralization, Tetrahedralization, TetError};
 use crate::util::GraphEx;
 
 /// Vertices are nodes weighted by positions.
@@ -23,6 +24,8 @@ impl PiecewiseLinearComplex {
     /// from a hopefully manifold tri-mesh.
     pub fn new(mesh: MaterialMesh) -> Self {
         let mesh = mesh.mesh();
+        let id_map = mesh.vertex_iter().enumerate().map(|(i, v)| (v, i))
+            .collect::<FnvHashMap<_, _>>();
         let vertices = mesh.vertex_iter().map(|v| mesh.vertex_position(v));
 
         let faces = mesh
@@ -36,9 +39,9 @@ impl PiecewiseLinearComplex {
             graph.add_node(pos);
         }
         for (i, ((a, b, c), normal, mat)) in faces.enumerate() {
-            let a = NodeIndex::new(a.deref() as usize);
-            let b = NodeIndex::new(b.deref() as usize);
-            let c = NodeIndex::new(c.deref() as usize);
+            let a = NodeIndex::new(id_map[&a] as usize);
+            let b = NodeIndex::new(id_map[&b] as usize);
+            let c = NodeIndex::new(id_map[&c] as usize);
             graph.add_edge(a, b, i);
             graph.add_edge(b, c, i);
             graph.add_edge(c, a, i);
@@ -56,14 +59,16 @@ impl PiecewiseLinearComplex {
 
     /// Gets rid of triangulation edges,
     /// i.e. edges that were only there to triangulate the mesh
-    fn dissolve(&mut self) {
-        let edges = self.mesh.edge_indices().collect::<Vec<_>>();
+    pub fn dissolve(&mut self) {
+        let edges = self.mesh.edge_references()
+            .map(|e| (e.source(), e.target(), *e.weight()))
+            .collect::<Vec<_>>();
 
         // Maps old face IDs to replacement face IDs
         let mut mapping = UnionFind::new(self.normals.len());
 
-        for edge in edges {
-            if let Some((s, t)) = self.mesh.edge_endpoints(edge) {
+        for (s, t, _) in edges {
+            if let Some(edge) = self.mesh.find_edge(s, t) {
                 if let Some(opposite) = self.mesh.find_edge(t, s) {
                     // Remove edge if faces have the same normal and material.
                     // Assumes the mesh is manifold possibly with boundary
@@ -74,7 +79,8 @@ impl PiecewiseLinearComplex {
                         && (self.normals[f1] - self.normals[f2]).magnitude() < Self::EPSILON
                     {
                         self.mesh.remove_edge(edge);
-                        self.mesh.remove_edge(opposite);
+                        // Removing the first edge could cause an invalidation
+                        self.mesh.remove_edge(self.mesh.find_edge(t, s).unwrap());
                         mapping.union(f1, f2);
                     }
                 }
@@ -92,11 +98,11 @@ impl PiecewiseLinearComplex {
         self.mesh.retain_nodes(|graph, n| graph.degree(n) > 0);
     }
 
-    fn tetrahedralize_vertices(&mut self) -> DelaunayTetrahedralization {
+    fn tetrahedralize_vertices(&mut self) -> Result<DelaunayTetrahedralization, TetError> {
         DelaunayTetrahedralization::new(self.mesh.node_weights_mut().map(|pos| *pos).collect())
     }
 
-    fn recover_edges(&mut self, dt: &mut DelaunayTetrahedralization) {
+    fn recover_edges(&mut self, dt: &mut DelaunayTetrahedralization) -> Result<(), TetError> {
         // Just subdivide each missing edge until it exists in the DT.
         // Edges here are undirected and thus their vertices are sorted by index.
         let mut edges = self
@@ -141,7 +147,7 @@ impl PiecewiseLinearComplex {
             missing.insert((s, v_new.index()));
             missing.insert((t, v_new.index()));
 
-            let (removed, added) = dt.add_point(pos);
+            let (removed, added) = dt.add_point(pos)?;
             for edge in removed {
                 if edges.contains(&edge) {
                     missing.insert(edge);
@@ -153,19 +159,67 @@ impl PiecewiseLinearComplex {
                 }
             }
         }
+
+        Ok(())
     }
 
     /// Tetrahedralizes the mesh and returns the
     /// vertex positions and tetrahedrons.
-    fn tetrahedralize(mut self) -> (Vec<Vec3>, Vec<([usize; 4], MaterialID)>) {
-        let mut dt = self.tetrahedralize_vertices();
-        self.recover_edges(&mut dt);
+    pub fn tetrahedralize(mut self) -> Result<Tetrahedralization, TetError> {
+        let mut dt = self.tetrahedralize_vertices()?;
+        //dt.export_debug_obj("assets/debug/test_-1_03_57_vertices.obj");
+        //dt.export_voronoi_debug_obj("assets/debug/test_-1_03_57_voronoi_vertices.obj");
+
+        self.recover_edges(&mut dt)?;
+        //dt.export_debug_obj("assets/debug/test_-17_001_040_edges.obj");
+        //dt.export_voronoi_debug_obj("assets/debug/test_-17_001_040_voronoi_edges.obj");
 
         // Recover faces
-        let (vertices, tets) = dt.tetrahedrons();
-        let tets = Tetrahedralization::new(vertices, tets);
+        let (vertices, tets) = dt.tetrahedrons()?;
+        let mut tets = Tetrahedralization::new(vertices, tets);
 
-        todo!()
+        let mut faces = FnvHashMap::default();
+        for edge in self.mesh.edge_references() {
+            let face_id = *edge.weight();
+            faces.entry(face_id).or_insert(vec![]).push([edge.source(), edge.target()]);
+        }
+
+        // Recover faces
+        //self.export_debug_obj("assets/debug/test_-17_001_040_plc.obj");
+        //tets.export_debug_obj("assets/debug/test_-17_001_040_before_flips.obj");
+        for (face_id, face) in &faces {
+            tets.recover_plc_face(&face.iter().map(|[a, b]| [a.index(), b.index()]).collect::<Vec<_>>(), 
+            self.normals[*face_id])?;
+        }
+        //tets.export_debug_obj("assets/debug/test_-17_001_040_after_flips.obj");
+
+        // Remove outside tets
+        let mut boundary = vec![];
+        for (face_id, face) in &faces {
+            boundary.extend(tets.plc_face_triangles(
+                &face.iter().map(|[a, b]| [a.index(), b.index()]).collect::<Vec<_>>(),
+                self.normals[*face_id]
+            )?);
+        }
+        tets.remove_tets_outside_boundary(&boundary);
+
+        Ok(tets)
+    }
+
+    pub fn export_debug_obj<P: AsRef<Path>>(&self, path: P) {
+        let mut output = String::from("o object\n");
+
+        for i in self.mesh.node_indices() {
+            let pos = self.mesh[i];
+            output += &format!("v {} {} {}\n", pos.x, pos.y, pos.z);
+        }
+
+        for e in self.mesh.edge_indices() {
+            let (s, t) = self.mesh.edge_endpoints(e).unwrap();
+            output += &format!("l {} {}\n", s.index() + 1, t.index() + 1);
+        }
+
+        std::fs::write(path, output).expect("Could not debug obj");
     }
 }
 
@@ -286,9 +340,20 @@ mod test {
                 2, 1, 0, 2, 0, 3, 3, 5, 2, 0, 1, 4, 4, 3, 0, 1, 2, 5, 5, 4, 1, 3, 4, 5,
             ],
         );
+        let plc = PiecewiseLinearComplex::new(mesh);
+        //let mut dt = plc.tetrahedralize_vertices();
+        //plc.recover_edges(&mut dt);
+        //dt.export_debug_obj("assets/debug/dt_test3.obj");
+        plc.tetrahedralize();
+    }
+
+    #[test]
+    #[ignore = "manual"]
+    fn test_custom() {
+        let obj = std::fs::read_to_string("assets/test.obj").unwrap();
+        let mesh = MaterialMesh::from_obj_1_material(obj).unwrap();
         let mut plc = PiecewiseLinearComplex::new(mesh);
-        let mut dt = plc.tetrahedralize_vertices();
-        plc.recover_edges(&mut dt);
-        dt.export_debug_obj("assets/debug/dt_test3.obj");
+        plc.dissolve();
+        plc.tetrahedralize();
     }
 }
